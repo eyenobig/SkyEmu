@@ -300,20 +300,24 @@ typedef struct {
   uint8_t wram[SB_WRAM_NUM_BANKS*SB_WRAM_BANK_SIZE];
 } sb_gb_mem_t;
 
+// DirectPlay GB/GBC 平台层 (提供 sb_cart_serial_t 与 GB 总线串口命令族)
+#include "cart_serial/gb_cart_serial.h"
+
 typedef struct {
   uint8_t *data;
-  uint8_t ram_data[MAX_CARTRIDGE_RAM]; 
+  uint8_t ram_data[MAX_CARTRIDGE_RAM];
   char title[17];
   bool game_boy_color;
   bool ram_write_enable;
-  bool ram_is_dirty; 
+  bool ram_is_dirty;
   uint8_t type;
-  uint8_t mbc_type; 
+  uint8_t mbc_type;
   uint8_t mapped_ram_bank;
   unsigned mapped_rom_bank;
   int rom_size;
   int ram_size;
   bool rumble;
+  sb_cart_serial_t* serial; // DirectPlay: 非 NULL 时 ROM 按 0x0000-0x7FFF 从真实卡带直读
   bool has_rumble; 
   bool bank_mode; //MBC1
 } sb_gb_cartridge_t;
@@ -434,7 +438,9 @@ typedef struct {
 typedef struct{
   uint8_t framebuffer[SB_LCD_H*SB_LCD_W*4];
   uint8_t bios[2304];
- } gb_scratch_t; 
+  // DirectPlay 串口直读状态 (GBA/GB/GBC 共用, 见 cart_serial/cart_serial_base.h)
+  sb_cart_serial_t serial;
+ } gb_scratch_t;
 
 // Return offset to bess structure
 static uint32_t sb_save_best_effort_state(sb_gb_t* gb){
@@ -514,6 +520,7 @@ static FORCE_INLINE uint8_t sb_read8_direct(sb_gb_t *gb, int addr) {
       cart_addr|=SB_BFE(gb->cart.mapped_ram_bank,0,2)<<19;
     }
     cart_addr%= (gb->cart.rom_size);
+    if(SB_UNLIKELY(gb->cart.serial)) return gb_serial_read_rom_byte(gb->cart.serial, cart_addr);
     return gb->cart.data[cart_addr];
   }else if(addr>=0x4000&&addr<=0x7fff){
     int cart_addr = SB_BFE(addr,0,14);
@@ -522,6 +529,7 @@ static FORCE_INLINE uint8_t sb_read8_direct(sb_gb_t *gb, int addr) {
       cart_addr|=SB_BFE(gb->cart.mapped_ram_bank,0,2)<<19;
     }
     cart_addr%= (gb->cart.rom_size);
+    if(SB_UNLIKELY(gb->cart.serial)) return gb_serial_read_rom_byte(gb->cart.serial, cart_addr);
     return gb->cart.data[cart_addr];
   }else if(addr>=0x8000&&addr<=0x9fff){
     uint8_t vbank =sb_read8_io(gb,SB_IO_GBC_VBK)%SB_VRAM_NUM_BANKS;
@@ -656,6 +664,11 @@ static FORCE_INLINE void sb_store8_direct(sb_gb_t *gb, int addr, int value) {
   gb->mem.data[addr]=value;
 }
 void sb_store8(sb_gb_t *gb, int addr, int value) {
+  // DirectPlay: 0x0000-0x7FFF 的写即 MBC 寄存器写, 原样转发到真实卡带以保持
+  // 两边 MBC bank/ram-enable 状态一致 (读取侧全部走 gb_serial_read_rom_byte 缓存)
+  if(SB_UNLIKELY(gb->cart.serial && addr>=0 && addr<=0x7fff)){
+    gb_serial_forward_bus_write(gb->cart.serial, (uint32_t)addr, (uint8_t)value);
+  }
   if(addr>=0xff00){
     if(!sb_gbc_enable(gb) &&addr>=0xff4C&&addr<=0xff7f&&addr!=SB_IO_BIOS_BANK)return;
     if(addr == SB_IO_DMA_SRC_LO ||addr == SB_IO_DMA_DST_LO){
@@ -1490,13 +1503,29 @@ float sb_bandlimited_square(float t, float duty_cycle,float dt){
   return y;
 }
 static bool sb_load_rom(sb_emu_state_t* emu,sb_gb_t* gb, gb_scratch_t* scratch){
-  if(!sb_path_has_file_ext(emu->rom_path,".gb") && 
-     !sb_path_has_file_ext(emu->rom_path,".gbc")) return false; 
-  if(emu->rom_size>MAX_CARTRIDGE_SIZE)return false;
+  if(!sb_path_has_file_ext(emu->rom_path,".gb") &&
+     !sb_path_has_file_ext(emu->rom_path,".gbc")) return false;
+  // DirectPlay: "READREALTIME" 文本配置 -> 真实卡带串口直读 (cart_serial/gb_cart_serial.h)
+  bool realtime = gb_is_realtime_config(emu->rom_data, emu->rom_size);
+  if(emu->rom_size>MAX_CARTRIDGE_SIZE && !realtime)return false;
+  if(gb->cart.serial) cs_serial_shutdown(gb->cart.serial); // 上一个会话的串口/缓存
   memset(gb, 0, sizeof(sb_gb_t));
   memset(scratch, 0, sizeof(gb_scratch_t));
+  if(realtime){
+    uint8_t* rom_data = NULL; size_t rom_size = 0;
+    if(!gb_serial_directplay_load(emu->rom_data, emu->rom_size, emu->save_data_base_path,
+                                  &scratch->serial, &rom_data, &rom_size)){
+      return false;
+    }
+    free(emu->rom_data);          // 释放配置文本, 换成 ROM 缓冲
+    emu->rom_data = rom_data;
+    emu->rom_size = rom_size;
+    gb->cart.serial = &scratch->serial;
+  }
   gb->cart.data = emu->rom_data;
-  for(size_t i = 0; i< 32*1024;++i)gb->mem.data[i] = gb->cart.data[i];
+  for(size_t i = 0; i< 32*1024;++i)
+    gb->mem.data[i] = gb->cart.serial ? gb_serial_read_rom_byte(gb->cart.serial, i)
+                                      : gb->cart.data[i];
   // Copy Header
   for (int i = 0; i < 11; ++i) {
     gb->cart.title[i] = gb->cart.data[i + 0x134];
@@ -1572,6 +1601,14 @@ static bool sb_load_rom(sb_emu_state_t* emu,sb_gb_t* gb, gb_scratch_t* scratch){
     gb->model = SB_GBC;
   }
   gb->cart.mapped_rom_bank=1;
+  if(gb->cart.serial){
+    // DirectPlay: 真实卡带 SRAM 为存档权威来源, 整块镜像到本地
+    scratch->serial.mbc_type = gb->cart.mbc_type;
+    if(!gb_serial_mirror_sram(gb->cart.serial, gb->cart.mbc_type,
+                              gb->cart.ram_data, gb->cart.ram_size)){
+      memset(gb->cart.ram_data,0xff,MAX_CARTRIDGE_RAM);
+    }
+  }else{
   size_t bytes =0;
   uint8_t*data = sb_load_file_data(emu->save_file_path, &bytes);
   if(data){
@@ -1587,7 +1624,8 @@ static bool sb_load_rom(sb_emu_state_t* emu,sb_gb_t* gb, gb_scratch_t* scratch){
     printf("Could not find save file: %s\n",emu->save_file_path);
     memset(gb->cart.ram_data,0,MAX_CARTRIDGE_RAM);
   }
-  bool loaded_bios = false; 
+  } // !gb->cart.serial
+  bool loaded_bios = false;
   if(gb->model==SB_GB){
     if(!emu->force_dmg_mode){
       if(!loaded_bios)loaded_bios= se_load_bios_file("GBC BOOT", emu->save_file_path, "cgb_boot.bin", scratch->bios,2304);

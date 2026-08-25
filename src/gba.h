@@ -7,27 +7,10 @@
 #include <stdarg.h>
 #include "arm7.h"
 #include "gba_bios.h"
+#include "cart_serial/serial_port.h"
+#include "cart_serial/cart_serial_base.h"
 #include <time.h>
 
-// 串口自动查找所需头文件
-// 注意：Windows 头文件必须在其他标准头文件之后包含
-#ifdef _WIN32
-  #ifndef WIN32_LEAN_AND_MEAN
-    #define WIN32_LEAN_AND_MEAN
-  #endif
-  #include <windows.h>
-  #include <setupapi.h>
-  #include <devguid.h>
-  #include <regstr.h>
-  #pragma comment(lib, "setupapi.lib")
-#elif defined(__APPLE__)
-  #include <CoreFoundation/CoreFoundation.h>
-  #include <IOKit/IOKitLib.h>
-  #include <IOKit/serial/IOSerialKeys.h>
-  #include <IOKit/usb/IOUSBLib.h>
-#elif defined(__linux__)
-  #include <dirent.h>
-#endif
 //Should be power of 2 for perf, 8192 samples gives ~85ms maximal latency for 48kHz
 #define LR 14
 #define PC 15
@@ -820,28 +803,7 @@ typedef struct{
   uint8_t last_clk;
 }gba_solar_sensor_t;
 
-// ROM实时读取协议类型
-typedef enum {
-  GBA_ROM_PROTOCOL_NONE = 0,
-  GBA_ROM_PROTOCOL_FILE = 1,
-  GBA_ROM_PROTOCOL_SERIAL = 2,
-  GBA_ROM_PROTOCOL_NET = 3
-} gba_rom_protocol_t;
 
-// 串口端口类型定义
-#ifdef _WIN32
-  // windows.h 已经在文件开头包含了
-  typedef HANDLE serial_port_t;
-  #define INVALID_SERIAL_PORT INVALID_HANDLE_VALUE
-#else
-  #include <fcntl.h>
-  #include <termios.h>
-  #include <unistd.h>
-  #include <errno.h>
-  #include <sys/ioctl.h>
-  typedef int serial_port_t;
-  #define INVALID_SERIAL_PORT -1
-#endif
 
 // 前向声明gba_scratch_t以便在gba_t中使用
 typedef struct gba_scratch_t gba_scratch_t;
@@ -883,14 +845,6 @@ typedef struct gba_t{
 } gba_t; 
 
 // 完整定义gba_scratch_t结构
-// 串口写入缓存项
-typedef struct {
-  uint32_t addr;      // 写入地址
-  uint8_t data;       // 写入数据
-  bool is_rom;        // true=ROM区域(writeRom), false=RAM区域(writeRam)
-} gba_serial_write_entry_t;
-
-#define GBA_SERIAL_WRITE_BUFFER_SIZE 2048
 
 struct gba_scratch_t{
   uint8_t framebuffer[GBA_LCD_W*GBA_LCD_H*4];
@@ -898,93 +852,12 @@ struct gba_scratch_t{
   FILE * log_cmp_file; 
   bool skip_bios_intro;
   char save_file_path[SB_FILE_PATH_SIZE];
-  // 实时ROM读取相关字段
-  bool use_realtime_rom;
-  gba_rom_protocol_t rom_protocol;
-  size_t realtime_rom_size;
-  char rom_source_address[SB_FILE_PATH_SIZE];
-  char rom_cache_path[SB_FILE_PATH_SIZE];
-  uint8_t *rom_cache_data;      // cache数据指针
-  uint8_t *rom_cache_valid;     // 每个字节的有效位标记(1=已缓存, 0=未缓存)
-  FILE *rom_source_file;        // 对于FILE协议，保持文件句柄打开
-  void *rom_source_serial;      // 对于SERIAL协议，保持串口句柄
-  int custom_backup_type;       // 自定义存档类型 (-1=自动检测, 其他=具体类型)
-  // 串口写入缓存
-  gba_serial_write_entry_t serial_write_buffer[GBA_SERIAL_WRITE_BUFFER_SIZE];
-  int serial_write_count;       // 当前缓存的写入数量
-  // RAM预读缓存 (用于GBA_BACKUP_DIRECT)
-  uint8_t *ram_prefetch_cache;  // 预读缓存数据 (2KB)
-  uint32_t ram_prefetch_start;  // 缓存起始地址
-  uint16_t ram_prefetch_size;   // 缓存大小 (通常2048字节)
-  bool ram_prefetch_valid;      // 缓存是否有效
-  // save同步延迟计数器
-  int save_sync_stable_frames;  // 存档稳定的帧数计数(连续10帧未修改才同步)
-  bool save_sync_pending;       // 是否有待同步的Flash数据
+  // DirectPlay 串口直读状态 (GBA/GB/GBC 共用, 见 cart_serial/cart_serial_base.h)
+  sb_cart_serial_t serial;
 };
 
-// 日志输出配置宏
-#ifndef GBA_SERIAL_LOG_ENABLED
-  #define GBA_SERIAL_LOG_ENABLED 1  // 默认启用日志
-#endif
+#include "cart_serial/gba_cart_serial.h"
 
-#ifndef GBA_SERIAL_LOG_TO_FILE
-  #define GBA_SERIAL_LOG_TO_FILE 0  // 默认输出到控制台，设置为1则输出到文件
-#endif
-
-#ifndef GBA_SERIAL_LOG_FILE_PATH
-  #define GBA_SERIAL_LOG_FILE_PATH "log.txt"  // 默认日志文件路径
-#endif
-
-// 日志文件句柄(全局静态变量)
-static FILE* log_file_handle = NULL;
-static bool log_file_initialized = false;
-
-// 日志输出函数
-static void log_printf(const char* format, ...) {
-#if GBA_SERIAL_LOG_ENABLED
-  va_list args;
-  va_start(args, format);
-  
-#if GBA_SERIAL_LOG_TO_FILE
-  // 输出到文件
-  if (!log_file_initialized) {
-    log_file_handle = fopen(GBA_SERIAL_LOG_FILE_PATH, "w");
-    log_file_initialized = true;
-    if (log_file_handle) {
-      fprintf(log_file_handle, "=== SkyEmu Serial Log ===\n");
-      fflush(log_file_handle);
-    }
-  }
-  
-  if (log_file_handle) {
-    vfprintf(log_file_handle, format, args);
-    fflush(log_file_handle);  // 立即刷新到文件
-  }
-#else
-  // 输出到控制台
-  vprintf(format, args);
-  fflush(stdout);
-#endif
-  
-  va_end(args);
-#else
-  (void)format;  // 避免未使用参数警告
-#endif
-}
-
-// 关闭日志文件
-static void log_close() {
-#if GBA_SERIAL_LOG_ENABLED && GBA_SERIAL_LOG_TO_FILE
-  if (log_file_handle) {
-    fprintf(log_file_handle, "=== Log Closed ===\n");
-    fclose(log_file_handle);
-    log_file_handle = NULL;
-    log_file_initialized = false;
-  }
-#endif
-}
-
-// 实时ROM读取函数的前向声明(需要在gba_dword_lookup之前)
 static uint8_t gba_read_rom_byte(gba_scratch_t *scratch, size_t offset);
 
 static void gba_process_audio_writes(gba_t* gba);
@@ -1342,8 +1215,8 @@ static void gba_process_solar_sensor(gba_t*gba){
 }
 static FORCE_INLINE void gba_store32(gba_t*gba, unsigned baddr, uint32_t data){
   // 串口模式：缓存写入，延迟到下次读取时合并发送
-  if(gba->scratch && gba->scratch->use_realtime_rom && 
-     gba->scratch->rom_protocol == GBA_ROM_PROTOCOL_SERIAL){
+  if(gba->scratch && gba->scratch->serial.use_realtime_rom && 
+     gba->scratch->serial.rom_protocol == SB_CART_PROTOCOL_SERIAL){
     
     // SRAM区域(0x0E000000-0x0FFFFFFF，包括镜像)
     if(gba->cart.backup_type==GBA_BACKUP_DIRECT && (baddr&0xfe000000)==0x0E000000){
@@ -1385,8 +1258,8 @@ static FORCE_INLINE void gba_store32(gba_t*gba, unsigned baddr, uint32_t data){
 }
 static FORCE_INLINE void gba_store16(gba_t*gba, unsigned baddr, uint32_t data){
   // 串口模式：缓存写入，延迟到下次读取时合并发送
-  if(gba->scratch && gba->scratch->use_realtime_rom && 
-     gba->scratch->rom_protocol == GBA_ROM_PROTOCOL_SERIAL){
+  if(gba->scratch && gba->scratch->serial.use_realtime_rom && 
+     gba->scratch->serial.rom_protocol == SB_CART_PROTOCOL_SERIAL){
     
     // SRAM区域(0x0E000000-0x0FFFFFFF，包括镜像)
     if(gba->cart.backup_type==GBA_BACKUP_DIRECT && (baddr&0xfe000000)==0x0E000000){
@@ -1433,8 +1306,8 @@ static FORCE_INLINE void gba_store16(gba_t*gba, unsigned baddr, uint32_t data){
 }
 static FORCE_INLINE void gba_store8(gba_t*gba, unsigned baddr, uint32_t data){
   // 串口模式：缓存写入，延迟到下次读取时合并发送
-  if(gba->scratch && gba->scratch->use_realtime_rom && 
-     gba->scratch->rom_protocol == GBA_ROM_PROTOCOL_SERIAL){
+  if(gba->scratch && gba->scratch->serial.use_realtime_rom && 
+     gba->scratch->serial.rom_protocol == SB_CART_PROTOCOL_SERIAL){
     
     // SRAM区域(0x0E000000-0x0FFFFFFF，包括镜像)
     if(gba->cart.backup_type==GBA_BACKUP_DIRECT && (baddr&0xfe000000)==0x0E000000){
@@ -1741,12 +1614,12 @@ static FORCE_INLINE uint32_t * gba_dword_lookup(gba_t* gba,unsigned addr, int re
           if(gba->cart.backup_type==GBA_BACKUP_EEPROM) gba->mem.openbus_word = 1; 
         }else{
           // 检查是否需要实时读取ROM
-          if(gba->scratch && gba->scratch->use_realtime_rom){
+          if(gba->scratch && gba->scratch->serial.use_realtime_rom){
             // 实时读取模式：检查缓存并按需加载
             uint8_t bytes[4];
             for(int i = 0; i < 4; i++){
               size_t offset = maddr + i;
-              if(offset < gba->scratch->realtime_rom_size){
+              if(offset < gba->scratch->serial.realtime_rom_size){
                 bytes[i] = gba_read_rom_byte(gba->scratch, offset);
               }else{
                 bytes[i] = 0xFF;
@@ -1770,32 +1643,32 @@ static FORCE_INLINE uint32_t * gba_dword_lookup(gba_t* gba,unsigned addr, int re
       if(gba->cart.backup_type==GBA_BACKUP_DIRECT){
         // 串口直接访问：使用预读取+缓存机制
         // SRAM是8位设备，读取1字节并复制到32位字的所有字节
-        if(gba->scratch && gba->scratch->use_realtime_rom && 
-           gba->scratch->rom_protocol == GBA_ROM_PROTOCOL_SERIAL) {
+        if(gba->scratch && gba->scratch->serial.use_realtime_rom && 
+           gba->scratch->serial.rom_protocol == SB_CART_PROTOCOL_SERIAL) {
           // 先刷新所有缓存的写入
           gba_flush_serial_writes(gba->scratch);
 
           uint32_t ram_addr = addr & 0xFFFF;  // 地址范围0-0xFFFF
-          serial_port_t port = *(serial_port_t*)gba->scratch->rom_source_serial;
+          serial_port_t port = *(serial_port_t*)gba->scratch->serial.rom_source_serial;
           uint8_t data = 0xFF;
           
           // 检查缓存是否命中
           bool cache_hit = false;
-          if (gba->scratch->ram_prefetch_valid && 
-              gba->scratch->ram_prefetch_cache &&
-              ram_addr >= gba->scratch->ram_prefetch_start &&
-              ram_addr < gba->scratch->ram_prefetch_start + gba->scratch->ram_prefetch_size) {
+          if (gba->scratch->serial.ram_prefetch_valid && 
+              gba->scratch->serial.ram_prefetch_cache &&
+              ram_addr >= gba->scratch->serial.ram_prefetch_start &&
+              ram_addr < gba->scratch->serial.ram_prefetch_start + gba->scratch->serial.ram_prefetch_size) {
             // 缓存命中
-            uint32_t offset = ram_addr - gba->scratch->ram_prefetch_start;
-            data = gba->scratch->ram_prefetch_cache[offset];
+            uint32_t offset = ram_addr - gba->scratch->serial.ram_prefetch_start;
+            data = gba->scratch->serial.ram_prefetch_cache[offset];
             cache_hit = true;
           } else {
             // 缓存未命中，预读取2KB数据
-            if (!gba->scratch->ram_prefetch_cache) {
-              gba->scratch->ram_prefetch_cache = (uint8_t*)malloc(2048);
+            if (!gba->scratch->serial.ram_prefetch_cache) {
+              gba->scratch->serial.ram_prefetch_cache = (uint8_t*)malloc(2048);
             }
             
-            if (gba->scratch->ram_prefetch_cache) {
+            if (gba->scratch->serial.ram_prefetch_cache) {
               // 计算预读起始地址(对齐到2KB边界)
               uint32_t prefetch_start = (ram_addr / 2048) * 2048;
               uint16_t prefetch_size = 2048;
@@ -1806,14 +1679,14 @@ static FORCE_INLINE uint32_t * gba_dword_lookup(gba_t* gba,unsigned addr, int re
               }
               
               // 预读取数据
-              if (gba_serial_read_ram(port, prefetch_start, gba->scratch->ram_prefetch_cache, prefetch_size)) {
-                gba->scratch->ram_prefetch_start = prefetch_start;
-                gba->scratch->ram_prefetch_size = prefetch_size;
-                gba->scratch->ram_prefetch_valid = true;
+              if (gba_serial_read_ram(port, prefetch_start, gba->scratch->serial.ram_prefetch_cache, prefetch_size)) {
+                gba->scratch->serial.ram_prefetch_start = prefetch_start;
+                gba->scratch->serial.ram_prefetch_size = prefetch_size;
+                gba->scratch->serial.ram_prefetch_valid = true;
                 
                 // 从缓存中获取数据
                 uint32_t offset = ram_addr - prefetch_start;
-                data = gba->scratch->ram_prefetch_cache[offset];
+                data = gba->scratch->serial.ram_prefetch_cache[offset];
                 cache_hit = true;
                 log_printf("[Serial] RAM prefetch: addr=0x%04x, size=%u bytes\n", 
                         prefetch_start, prefetch_size);
@@ -2043,1538 +1916,13 @@ int gba_search_rom_for_backup_string(gba_t* gba){
   return btype; 
 }
 
-// 实时ROM读取辅助函数 - 读取指定范围的字节
-static bool gba_load_realtime_rom_bytes_from_file(FILE* file, size_t offset, uint8_t* buffer, size_t size) {
-  if (!file) {
-    return false;
-  }
-  
-  if (fseek(file, offset, SEEK_SET) != 0) {
-    log_printf("Failed to seek to offset %zu in ROM file\n", offset);
-    return false;
-  }
-  
-  size_t bytes_read = fread(buffer, 1, size, file);
-  if (bytes_read != size) {
-    log_printf("Failed to read %zu bytes at offset %zu: read %zu bytes\n", size, offset, bytes_read);
-    return false;
-  }
-  
-  return true;
-}
-
-
-// DTR控制函数(模拟Python的ser.dtr操作)
-static void gba_serial_set_dtr(serial_port_t port, bool state) {
-#ifdef _WIN32
-  EscapeCommFunction(port, state ? SETDTR : CLRDTR);
-#else
-  int flag = TIOCM_DTR;
-  if (state) {
-    ioctl(port, TIOCMBIS, &flag); // Set DTR
-  } else {
-    ioctl(port, TIOCMBIC, &flag); // Clear DTR
-  }
-#endif
-}
-
-// 自动查找串口设备(VID=0x0483, PID=0x0721)
-static char* gba_auto_find_serial_port() {
-#ifdef _WIN32
-  // Windows: 使用SetupAPI枚举串口设备
-  static char port_path[256] = {0};
-  HDEVINFO deviceInfoSet;
-  SP_DEVINFO_DATA deviceInfoData;
-  DWORD deviceIndex = 0;
-  
-  log_printf("[Serial] Searching for USB serial devices (Windows)...\n");
-  
-  // 获取所有串口设备
-  deviceInfoSet = SetupDiGetClassDevs(&GUID_DEVCLASS_PORTS, NULL, NULL, DIGCF_PRESENT);
-  if (deviceInfoSet == INVALID_HANDLE_VALUE) {
-    log_printf("[Serial] ERROR: Failed to get device information set\n");
-    return NULL;
-  }
-  
-  deviceInfoData.cbSize = sizeof(SP_DEVINFO_DATA);
-  
-  // 枚举所有串口设备
-  while (SetupDiEnumDeviceInfo(deviceInfoSet, deviceIndex++, &deviceInfoData)) {
-    HKEY hDeviceRegistryKey;
-    char portName[256] = {0};
-    DWORD size = sizeof(portName);
-    
-    // 获取端口名称 (COM1, COM2, 等)
-    hDeviceRegistryKey = SetupDiOpenDevRegKey(deviceInfoSet, &deviceInfoData,
-                                               DICS_FLAG_GLOBAL, 0,
-                                               DIREG_DEV, KEY_READ);
-    if (hDeviceRegistryKey != INVALID_HANDLE_VALUE) {
-      DWORD type = REG_SZ;
-      if (RegQueryValueExA(hDeviceRegistryKey, "PortName", NULL, &type,
-                           (LPBYTE)portName, &size) == ERROR_SUCCESS) {
-        
-        // 获取设备的硬件ID以提取VID和PID
-        char hardwareID[1024] = {0};
-        if (SetupDiGetDeviceRegistryPropertyA(deviceInfoSet, &deviceInfoData,
-                                               SPDRP_HARDWAREID, NULL,
-                                               (PBYTE)hardwareID, sizeof(hardwareID), NULL)) {
-          
-          // 解析 VID 和 PID (格式: USB\VID_0483&PID_0721)
-          int vid = 0, pid = 0;
-          if (sscanf(hardwareID, "USB\\VID_%x&PID_%x", &vid, &pid) == 2) {
-            log_printf("[Serial]   Found: %s (VID=0x%04x, PID=0x%04x)\n", portName, vid, pid);
-            
-            if (vid == 0x0483 && pid == 0x0721) {
-              log_printf("[Serial]   *** Matched target device!\n");
-              snprintf(port_path, sizeof(port_path), "\\\\.\\%s", portName);
-              RegCloseKey(hDeviceRegistryKey);
-              SetupDiDestroyDeviceInfoList(deviceInfoSet);
-              return port_path;
-            }
-          }
-        }
-      }
-      RegCloseKey(hDeviceRegistryKey);
-    }
-  }
-  
-  SetupDiDestroyDeviceInfoList(deviceInfoSet);
-  log_printf("[Serial] No matching device found (VID=0x0483, PID=0x0721)\n");
-  return NULL;
-  
-#elif defined(__APPLE__)
-  // macOS: 使用IOKit查找USB设备
-  static char port_path[256] = {0};
-  io_iterator_t serialPortIterator = 0;
-  io_object_t serialPort;
-  
-  // 创建匹配字典
-  CFMutableDictionaryRef matchingDict = IOServiceMatching(kIOSerialBSDServiceValue);
-  if (!matchingDict) return NULL;
-  
-  // 查找所有串口设备
-  kern_return_t kr = IOServiceGetMatchingServices(kIOMasterPortDefault, matchingDict, &serialPortIterator);
-  if (kr != KERN_SUCCESS) return NULL;
-  
-  log_printf("[Serial] Searching for USB serial devices...\n");
-  
-  while ((serialPort = IOIteratorNext(serialPortIterator))) {
-    // 获取设备路径
-    CFTypeRef devicePath = IORegistryEntryCreateCFProperty(serialPort,
-                                                           CFSTR(kIOCalloutDeviceKey),
-                                                           kCFAllocatorDefault, 0);
-    if (devicePath) {
-      if (CFStringGetCString(devicePath, port_path, sizeof(port_path), kCFStringEncodingUTF8)) {
-        // 获取USB父设备以检查VID/PID
-        io_registry_entry_t parent;
-        kern_return_t kr = IORegistryEntryGetParentEntry(serialPort, kIOServicePlane, &parent);
-        while (kr == KERN_SUCCESS) {
-          CFTypeRef vid = IORegistryEntryCreateCFProperty(parent, CFSTR("idVendor"), kCFAllocatorDefault, 0);
-          CFTypeRef pid = IORegistryEntryCreateCFProperty(parent, CFSTR("idProduct"), kCFAllocatorDefault, 0);
-          
-          if (vid && pid) {
-            int vendor_id = 0, product_id = 0;
-            CFNumberGetValue(vid, kCFNumberIntType, &vendor_id);
-            CFNumberGetValue(pid, kCFNumberIntType, &product_id);
-            
-            log_printf("[Serial]   Found: %s (VID=0x%04x, PID=0x%04x)\n", port_path, vendor_id, product_id);
-            
-            if (vendor_id == 0x0483 && product_id == 0x0721) {
-              log_printf("[Serial]   *** Matched target device!\n");
-              if (vid) CFRelease(vid);
-              if (pid) CFRelease(pid);
-              IOObjectRelease(parent);
-              CFRelease(devicePath);
-              IOObjectRelease(serialPort);
-              IOObjectRelease(serialPortIterator);
-              return port_path;
-            }
-            if (vid) CFRelease(vid);
-            if (pid) CFRelease(pid);
-          }
-          
-          io_registry_entry_t next_parent;
-          kr = IORegistryEntryGetParentEntry(parent, kIOServicePlane, &next_parent);
-          IOObjectRelease(parent);
-          parent = next_parent;
-        }
-      }
-      CFRelease(devicePath);
-    }
-    IOObjectRelease(serialPort);
-  }
-  IOObjectRelease(serialPortIterator);
-  
-  log_printf("[Serial] No matching device found (VID=0x0483, PID=0x0721)\n");
-  return NULL;
-#elif defined(__linux__)
-  // Linux: 读取/sys/bus/usb-serial/devices/
-  static char port_path[256] = {0};
-  DIR *dir = opendir("/sys/class/tty");
-  if (!dir) return NULL;
-  
-  log_printf("[Serial] Searching for USB serial devices...\n");
-  
-  struct dirent *entry;
-  while ((entry = readdir(dir)) != NULL) {
-    if (strncmp(entry->d_name, "ttyUSB", 6) == 0 || strncmp(entry->d_name, "ttyACM", 6) == 0) {
-      char path[512];
-      snprintf(path, sizeof(path), "/sys/class/tty/%s/device/../idVendor", entry->d_name);
-      
-      FILE *f = fopen(path, "r");
-      if (f) {
-        int vid = 0;
-        fscanf(f, "%x", &vid);
-        fclose(f);
-        
-        snprintf(path, sizeof(path), "/sys/class/tty/%s/device/../idProduct", entry->d_name);
-        f = fopen(path, "r");
-        if (f) {
-          int pid = 0;
-          fscanf(f, "%x", &pid);
-          fclose(f);
-          
-          snprintf(port_path, sizeof(port_path), "/dev/%s", entry->d_name);
-          log_printf("[Serial]   Found: %s (VID=0x%04x, PID=0x%04x)\n", port_path, vid, pid);
-          
-          if (vid == 0x0483 && pid == 0x0721) {
-            log_printf("[Serial]   *** Matched target device!\n");
-            closedir(dir);
-            return port_path;
-          }
-        }
-      }
-    }
-  }
-  closedir(dir);
-  
-  log_printf("[Serial] No matching device found (VID=0x0483, PID=0x0721)\n");
-  return NULL;
-#else
-  log_printf("[Serial] Auto-detection not implemented for this platform\n");
-  return NULL;
-#endif
-}
-
-static serial_port_t gba_open_serial_port(const char* port_name) {
-  // 如果是 "AUTO"，自动查找设备
-  if (strcmp(port_name, "AUTO") == 0) {
-    log_printf("[Serial] AUTO mode: searching for device...\n");
-    const char* found_port = gba_auto_find_serial_port();
-    if (!found_port) {
-      log_printf("[Serial] ERROR: No device found in AUTO mode\n");
-      return INVALID_SERIAL_PORT;
-    }
-    port_name = found_port;
-    log_printf("[Serial] Using auto-detected port: %s\n", port_name);
-  }
-  
-#ifdef _WIN32
-  HANDLE handle = CreateFileA(port_name, GENERIC_READ | GENERIC_WRITE, 0, NULL,
-                               OPEN_EXISTING, 0, NULL);
-  if (handle == INVALID_HANDLE_VALUE) {
-    log_printf("Failed to open serial port: %s\n", port_name);
-    return INVALID_SERIAL_PORT;
-  }
-  
-  DCB dcb = {0};
-  dcb.DCBlength = sizeof(DCB);
-  if (!GetCommState(handle, &dcb)) {
-    CloseHandle(handle);
-    return INVALID_SERIAL_PORT;
-  }
-  
-  dcb.BaudRate = CBR_115200;
-  dcb.ByteSize = 8;
-  dcb.StopBits = ONESTOPBIT;
-  dcb.Parity = NOPARITY;
-  
-  if (!SetCommState(handle, &dcb)) {
-    CloseHandle(handle);
-    return INVALID_SERIAL_PORT;
-  }
-  
-  // 执行DTR重置序列
-  gba_serial_set_dtr(handle, true);
-  Sleep(100); // 等待100ms
-  gba_serial_set_dtr(handle, false);
-  Sleep(100); // 等待100ms
-  
-  log_printf("Serial port opened and reset: %s\n", port_name);
-  
-  return handle;
-#else
-  int fd = open(port_name, O_RDWR | O_NOCTTY | O_SYNC);
-  if (fd < 0) {
-    log_printf("Failed to open serial port: %s\n", port_name);
-    return INVALID_SERIAL_PORT;
-  }
-  
-  struct termios tty;
-  if (tcgetattr(fd, &tty) != 0) {
-    close(fd);
-    return INVALID_SERIAL_PORT;
-  }
-  
-  // 设置波特率 115200
-  cfsetospeed(&tty, B115200);
-  cfsetispeed(&tty, B115200);
-  
-  // 配置为8N1(8数据位，无校验，1停止位)
-  tty.c_cflag = (tty.c_cflag & ~CSIZE) | CS8;     // 8位数据
-  tty.c_cflag &= ~PARENB;                          // 无校验
-  tty.c_cflag &= ~PARODD;
-  tty.c_cflag &= ~CSTOPB;                          // 1停止位
-  tty.c_cflag &= ~CRTSCTS;                         // 禁用硬件流控
-  tty.c_cflag |= (CLOCAL | CREAD);                 // 启用接收，忽略调制解调器状态
-  
-  // 禁用软件流控
-  tty.c_iflag &= ~(IXON | IXOFF | IXANY);
-  tty.c_iflag &= ~(IGNBRK | BRKINT | PARMRK | ISTRIP | INLCR | IGNCR | ICRNL);
-  
-  // 原始模式
-  tty.c_lflag = 0;  // 非规范模式，无回显
-  tty.c_oflag = 0;  // 禁用输出处理
-  
-  // 设置读取超时
-  tty.c_cc[VMIN] = 0;   // 非阻塞读取
-  tty.c_cc[VTIME] = 20; // 2秒超时(单位0.1秒)，匹配Python的timeout=2
-  
-  if (tcsetattr(fd, TCSANOW, &tty) != 0) {
-    close(fd);
-    return INVALID_SERIAL_PORT;
-  }
-  
-  // 执行DTR重置序列(就像Python代码中的 ser.dtr = True; ser.dtr = False)
-  //printf("[Serial] Performing DTR reset sequence...\n");
-  gba_serial_set_dtr(fd, true);
-  log_printf("[Serial] DTR = HIGH\n");
-  usleep(10000); // 等待10ms
-  gba_serial_set_dtr(fd, false);
-  log_printf("[Serial] DTR = LOW\n");
-  usleep(20000); // 等待20ms，给设备更多时间初始化
-  
-  // 清空可能残留的数据
-  tcflush(fd, TCIOFLUSH);
-  
-  log_printf("[Serial] Port %s opened successfully\n", port_name);
-  log_printf("[Serial] Configuration: 115200 8N1, no flow control\n");
-  
-  return fd;
-#endif
-}
-
-static void gba_close_serial_port(serial_port_t port) {
-  if (port == INVALID_SERIAL_PORT) return;
-#ifdef _WIN32
-  CloseHandle(port);
-#else
-  close(port);
-#endif
-}
-
-static size_t gba_serial_write(serial_port_t port, const uint8_t* data, size_t size) {
-#ifdef _WIN32
-  DWORD written = 0;
-  if (!WriteFile(port, data, size, &written, NULL)) {
-    log_printf("[Serial] WriteFile error: %lu\n", GetLastError());
-    return 0;
-  }
-  FlushFileBuffers(port); // 确保数据发送
-  return written;
-#else
-  ssize_t written = write(port, data, size);
-  if (written < 0) {
-    log_printf("[Serial] Write error: %s (errno=%d)\n", strerror(errno), errno);
-    return 0;
-  }
-  // 确保数据发送完成
-  tcdrain(port);
-  return written;
-#endif
-}
-
-static size_t gba_serial_read(serial_port_t port, uint8_t* data, size_t size) {
-#ifdef _WIN32
-  DWORD read_count = 0;
-  if (!ReadFile(port, data, size, &read_count, NULL)) {
-    return 0;
-  }
-  return read_count;
-#else
-  size_t total_read = 0;
-  while (total_read < size) {
-    ssize_t n = read(port, data + total_read, size - total_read);
-    if (n < 0) {
-      if (errno == EAGAIN || errno == EINTR) {
-        continue; // 重试
-      }
-      return total_read; // 错误
-    } else if (n == 0) {
-      break; // 超时或连接关闭
-    }
-    total_read += n;
-  }
-  return total_read;
-#endif
-}
-
-// 根据Python协议实现串口读取ROM
-// Python代码: cmd.extend(struct.pack("<H", 2 + 1 + 4 + 2 + 2))
-//            cmd.append(0xf6)
-//            cmd.extend(struct.pack("<I", addr_word << 1))
-//            cmd.extend(struct.pack("<H", length_byte))
-//            cmd.extend([0, 0])
-static bool gba_serial_read_rom(serial_port_t port, uint32_t addr_word, uint8_t* buffer, uint16_t length_byte) {
-  // 构建命令包: readRom(addr_word, length_byte)
-  // 注意：Python中addr_word是字地址，传输时需要<<1转为字节地址
-  uint8_t cmd[11];
-  uint16_t cmd_len = 11; // 2(长度) + 1(命令) + 4(地址) + 2(长度) + 2(填充) = 11
-  
-  // 填充命令总长度(小端序)
-  cmd[0] = cmd_len & 0xFF;
-  cmd[1] = (cmd_len >> 8) & 0xFF;
-  
-  // 命令码 0xf6 (读ROM)
-  cmd[2] = 0xf6;
-  
-  // 地址：将字地址转为字节地址(addr_word << 1)，小端序
-  uint32_t byte_addr = addr_word << 1;
-  cmd[3] = byte_addr & 0xFF;
-  cmd[4] = (byte_addr >> 8) & 0xFF;
-  cmd[5] = (byte_addr >> 16) & 0xFF;
-  cmd[6] = (byte_addr >> 24) & 0xFF;
-  
-  // 数据长度(小端序)
-  cmd[7] = length_byte & 0xFF;
-  cmd[8] = (length_byte >> 8) & 0xFF;
-  
-  // 填充字节
-  cmd[9] = 0;
-  cmd[10] = 0;
-  
-  // 打印详细的命令信息
-  // printf("\n[Serial] === Read ROM Command ===\n");
-  // printf("[Serial] addr_word=0x%08x, byte_addr=0x%08x, length=%u bytes\n", 
-  //        addr_word, byte_addr, length_byte);
-  // printf("[Serial] Command bytes (11): ");
-  // for (int i = 0; i < 11; i++) {
-  //   printf("%02x ", cmd[i]);
-  // }
-  // printf("\n");
-  // printf("[Serial] Breakdown:\n");
-  // printf("[Serial]   Length: %02x %02x (%u)\n", cmd[0], cmd[1], cmd_len);
-  // printf("[Serial]   Command: %02x\n", cmd[2]);
-  // printf("[Serial]   Address: %02x %02x %02x %02x (0x%08x)\n", 
-  //        cmd[3], cmd[4], cmd[5], cmd[6], byte_addr);
-  // printf("[Serial]   Data Length: %02x %02x (%u)\n", cmd[7], cmd[8], length_byte);
-  // printf("[Serial]   Padding: %02x %02x\n", cmd[9], cmd[10]);
-  
-  // 清空串口缓冲区
-#ifndef _WIN32
-  tcflush(port, TCIOFLUSH);
-#else
-  PurgeComm(port, PURGE_RXCLEAR | PURGE_TXCLEAR);
-#endif
-  
-  // 发送命令
-  // printf("[Serial] Sending command...\n");
-  size_t written = gba_serial_write(port, cmd, 11);
-  if (written != 11) {
-    log_printf("[Serial] ERROR: Failed to write command (wrote %zu/11 bytes)\n", written);
-    return false;
-  }
-  // printf("[Serial] Command sent successfully (%zu bytes)\n", written);
-  
-  
-  // 读取响应 (length_byte + 2)
-  size_t response_size = length_byte + 2;
-  uint8_t* response = (uint8_t*)malloc(response_size);
-  if (!response) {
-    log_printf("[Serial] ERROR: Failed to allocate %zu bytes for response\n", response_size);
-    return false;
-  }
-  
-  // 尝试一次性读取所有数据(类似Python的ser.read(size))
-  size_t total_read = 0;
-  int retry_count = 0;
-  const int max_retries = 30; // 减少重试次数，但增加每次等待时间
-  
-  while (total_read < response_size && retry_count < max_retries) {
-    size_t read_count = gba_serial_read(port, response + total_read, response_size - total_read);
-    if (read_count > 0) {
-      total_read += read_count;
-      // printf("[Serial] Read %zu bytes, total: %zu/%zu (%.1f%%)\n", 
-      //        read_count, total_read, response_size, (total_read * 100.0) / response_size);
-      // 如果还没读完，稍微等待一下
-      if (total_read < response_size) {
-#ifdef _WIN32
-        Sleep(1);
-#else
-        usleep(1000);
-#endif
-      }
-    } else {
-      retry_count++;
-      if (retry_count == 1 || retry_count % 5 == 0) {
-        log_printf("[Serial] Waiting for data... retry %d, received: %zu/%zu bytes\n", 
-               retry_count, total_read, response_size);
-      }
-      // 每次重试等待更长时间
-#ifdef _WIN32
-      Sleep(10);
-#else
-      usleep(10000);
-#endif
-    }
-  }
-  
-  if (total_read < response_size) {
-    log_printf("[Serial] ERROR: Failed to read complete response (read %zu/%zu bytes after %d retries)\n", 
-           total_read, response_size, retry_count);
-    if (total_read > 0) {
-      log_printf("[Serial] Received data: ");
-      for (size_t i = 0; i < (total_read < 32 ? total_read : 32); i++) {
-        log_printf("%02x ", response[i]);
-      }
-      if (total_read > 32) printf("...");
-      log_printf("\n");
-    }
-    free(response);
-    return false;
-  }
-  
-  // printf("[Serial] Response received successfully\n");
-  // printf("[Serial] First 16 bytes: ");
-  // for (size_t i = 0; i < (response_size < 16 ? response_size : 16); i++) {
-  //   printf("%02x ", response[i]);
-  // }
-  // if (response_size > 16) printf("...");
-  // printf("\n");
-  
-  // 跳过前2字节，复制数据
-  memcpy(buffer, response + 2, length_byte);
-  free(response);
-  
-  return true;
-}
-
-// 刷新串口写入缓存 - 合并连续地址的写入(ROM和RAM分别合并)
-static void gba_flush_serial_writes(gba_scratch_t *scratch) {
-  if (!scratch || scratch->serial_write_count == 0) {
-    return;
-  }
-  
-  static int flush_count = 0;
-  if (flush_count < 10 || flush_count % 100 == 0) {
-    log_printf("[Serial] Flushing write buffer #%d: %d writes pending\n", 
-           flush_count, scratch->serial_write_count);
-  }
-  flush_count++;
-  
-  serial_port_t port = *(serial_port_t*)scratch->rom_source_serial;
-  
-  // 合并连续地址的写入(保持原始顺序，ROM和RAM分别合并)
-  int i = 0;
-  static int batch_count = 0;
-  
-  while (i < scratch->serial_write_count) {
-    gba_serial_write_entry_t *start = &scratch->serial_write_buffer[i];
-    
-    // 查找连续的写入(必须是同类型且地址连续)
-    int count = 1;
-    while (i + count < scratch->serial_write_count) {
-      gba_serial_write_entry_t *next = &scratch->serial_write_buffer[i + count];
-      // 关键检查：同类型(ROM/RAM)且地址连续
-      if (next->is_rom == start->is_rom && 
-          next->addr == start->addr + count) {
-        count++;
-      } else {
-        break;  // 遇到不同类型或地址不连续，停止合并
-      }
-    }
-    
-    // 如果找到多个连续的写入，合并发送
-    if (count > 1) {
-      // 分配数据缓冲区
-      uint8_t *data = (uint8_t*)malloc(count);
-      if (data) {
-        for (int j = 0; j < count; j++) {
-          data[j] = scratch->serial_write_buffer[i + j].data;
-        }
-        
-        if (batch_count < 200 || batch_count % 400 == 0) {
-          log_printf("[Serial] Batch #%d: %s addr=0x%08x, %d bytes (merged) ", 
-                 batch_count, start->is_rom ? "ROM" : "RAM", start->addr, count);
-          //print data (first 16byte)
-          for (int j = 0; j < (count < 16 ? count : 16); j++) {
-            log_printf("%02x ", data[j]);
-          }
-          if (count > 16) printf("...");
-          printf("\n");
-        }
-        batch_count++;
-        
-        // 根据类型选择写入函数
-        if (start->is_rom) {
-          uint32_t addr_word = start->addr >> 1; // 转为字地址
-          gba_serial_write_rom(port, addr_word, data, count);
-        } else {
-          gba_serial_write_ram(port, start->addr, data, count);
-        }
-        
-        free(data);
-      }
-    } else {
-      // 单个写入
-      if (batch_count < 200 || batch_count % 400 == 0) {
-        log_printf("[Serial] Batch #%d: %s addr=0x%08x, 1 byte\n", 
-               batch_count, start->is_rom ? "ROM" : "RAM", start->addr);
-      }
-      batch_count++;
-      
-      if (start->is_rom) {
-        uint32_t addr_word = start->addr >> 1; // 转为字地址
-        uint16_t data = start->data; // 单字节数据
-        gba_serial_write_rom(port, addr_word, (uint8_t*)&data, 2);
-      } else {
-        gba_serial_write_ram(port, start->addr, &start->data, 1);
-      }
-    }
-    
-    i += count;
-  }
-  
-  // 清空缓存
-  scratch->serial_write_count = 0;
-}
-
-// 添加写入到缓存
-static void gba_buffer_serial_write(gba_scratch_t *scratch, uint32_t addr, uint8_t data, bool is_rom) {
-  if (!scratch) return;
-  
-  // 任何写入(无论ROM还是RAM)都会使RAM预读缓存失效
-  if (scratch->ram_prefetch_valid) {
-    scratch->ram_prefetch_valid = false;
-      log_printf("[Serial] RAM prefetch cache invalidated due to %s write at 0x%08x\n",
-            is_rom ? "ROM" : "RAM", addr);
-  }
-  // 疑似写命令,部分地址标记为不缓存
-  if (data == 0x30 || data == 0x20 || data == 0x60) {
-    for (int i = 0; i < 512; i++) {
-        scratch->rom_cache_valid[addr + i] = 0xFF;
-    }
-  }
-  scratch->rom_cache_valid[addr] = 0xFF;
-
-  // 如果缓存满了，先刷新
-  if (scratch->serial_write_count >= GBA_SERIAL_WRITE_BUFFER_SIZE) {
-    gba_flush_serial_writes(scratch);
-  }
-  
-  // 添加到缓存
-  gba_serial_write_entry_t *entry = &scratch->serial_write_buffer[scratch->serial_write_count++];
-  entry->addr = addr;
-  entry->data = data;
-  entry->is_rom = is_rom;
-}
-
-// 串口写入ROM(命令0xf5)
-// Python: writeRom(addr_word, dat)
-static bool gba_serial_write_rom(serial_port_t port, uint32_t addr_word, const uint8_t* data, uint16_t data_len) {
-  if (port == INVALID_SERIAL_PORT || !data || data_len == 0) {
-    return false;
-  }
-  
-  // 构建命令包
-  uint16_t cmd_len = 2 + 1 + 4 + data_len + 2;
-  uint8_t* cmd = (uint8_t*)malloc(cmd_len);
-  if (!cmd) return false;
-  
-  // Python: struct.pack("<H", 2 + 1 + 4 + len(dat) + 2)
-  // 长度字段包含：长度字段自己(2) + 命令(1) + 地址(4) + 数据(data_len) + 填充(2)
-  uint16_t body_len = 2 + 1 + 4 + data_len + 2;
-  cmd[0] = body_len & 0xFF;
-  cmd[1] = (body_len >> 8) & 0xFF;
-  cmd[2] = 0xf5; // 写ROM命令
-  
-  // 地址(字地址，不需要<<1)
-  cmd[3] = addr_word & 0xFF;
-  cmd[4] = (addr_word >> 8) & 0xFF;
-  cmd[5] = (addr_word >> 16) & 0xFF;
-  cmd[6] = (addr_word >> 24) & 0xFF;
-  
-  // 数据
-  memcpy(cmd + 7, data, data_len);
-  
-  // 填充
-  cmd[7 + data_len] = 0;
-  cmd[8 + data_len] = 0;
-  
-  // 发送命令
-  size_t written = gba_serial_write(port, cmd, cmd_len);
-  free(cmd);
-  
-  if (written != cmd_len) {
-    log_printf("[Serial] ERROR: Failed to write ROM command\n");
-    return false;
-  }
-  
-  // 尝试读取1字节ACK(非阻塞，超时后继续)
-  uint8_t ack;
-  size_t ack_read = 0;
-  int retry = 0;
-  while (ack_read == 0 && retry < 5) {
-    ack_read = gba_serial_read(port, &ack, 1);
-    if (ack_read == 0) {
-      retry++;
-#ifdef _WIN32
-      Sleep(1);
-#else
-      usleep(1000);
-#endif
-    }
-  }
-  
-  // ACK读取失败只记录警告，不中断操作
-  if (ack_read != 1) {
-    static int warn_count = 0;
-    if (warn_count < 3) {
-      log_printf("[Serial] WARNING: No ACK for ROM write (retry %d)\n", retry);
-      warn_count++;
-    }
-  }
-  
-  return true;
-}
-
-// 串口读取RAM(命令0xf8)
-// Python: readRam(addr, length_byte)
-static bool gba_serial_read_ram(serial_port_t port, uint32_t addr, uint8_t* buffer, uint16_t length_byte) {
-  if (port == INVALID_SERIAL_PORT || !buffer || length_byte == 0) {
-    return false;
-  }
-  
-  // 构建命令包
-  uint8_t cmd[11];
-  // Python: struct.pack("<H", 2 + 1 + 4 + 2 + 2) = 11
-  // 长度字段包含：长度字段自己(2) + 命令(1) + 地址(4) + 数据长度(2) + 填充(2)
-  uint16_t cmd_body_len = 2 + 1 + 4 + 2 + 2;
-
-  cmd[0] = cmd_body_len & 0xFF;
-  cmd[1] = (cmd_body_len >> 8) & 0xFF;
-  cmd[2] = 0xf8; // 读RAM命令
-  
-  // 地址(字节地址)
-  cmd[3] = addr & 0xFF;
-  cmd[4] = (addr >> 8) & 0xFF;
-  cmd[5] = (addr >> 16) & 0xFF;
-  cmd[6] = (addr >> 24) & 0xFF;
-  
-  // 长度
-  cmd[7] = length_byte & 0xFF;
-  cmd[8] = (length_byte >> 8) & 0xFF;
-  
-  // 填充
-  cmd[9] = 0;
-  cmd[10] = 0;
-  
-  // 发送命令
-  size_t written = gba_serial_write(port, cmd, 11);
-  if (written != 11) {
-    log_printf("[Serial] ERROR: Failed to write RAM read command\n");
-    return false;
-  }
-  
-  // 读取响应 (length_byte + 2)
-  size_t response_size = length_byte + 2;
-  uint8_t* response = (uint8_t*)malloc(response_size);
-  if (!response) {
-    return false;
-  }
-  
-  size_t total_read = 0;
-  int retry_count = 0;
-  const int max_retries = 20;
-  
-  while (total_read < response_size && retry_count < max_retries) {
-    size_t read_count = gba_serial_read(port, response + total_read, response_size - total_read);
-    if (read_count > 0) {
-      total_read += read_count;
-      if (total_read < response_size) {
-#ifdef _WIN32
-        Sleep(1);
-#else
-        usleep(1000);
-#endif
-      }
-    } else {
-      retry_count++;
-#ifdef _WIN32
-      Sleep(10);
-#else
-      usleep(10000);
-#endif
-    }
-  }
-  
-  if (total_read < response_size) {
-    log_printf("[Serial] ERROR: Failed to read RAM response (%zu/%zu bytes)\n", total_read, response_size);
-    free(response);
-    return false;
-  }
-  
-  // 跳过前2字节，复制数据
-  memcpy(buffer, response + 2, length_byte);
-  free(response);
-  
-  return true;
-}
-
-// 串口写入RAM(命令0xf7)
-// Python: writeRam(addr, dat)
-static bool gba_serial_write_ram(serial_port_t port, uint32_t addr, const uint8_t* data, uint16_t data_len) {
-  if (port == INVALID_SERIAL_PORT || !data || data_len == 0) {
-    return false;
-  }
-  
-  // 构建命令包
-  uint16_t cmd_len = 2 + 1 + 4 + data_len + 2;
-  uint8_t* cmd = (uint8_t*)malloc(cmd_len);
-  if (!cmd) return false;
-  
-  // Python: struct.pack("<H", 2 + 1 + 4 + len(dat) + 2)
-  // 长度字段包含：长度字段自己(2) + 命令(1) + 地址(4) + 数据(data_len) + 填充(2)
-  uint16_t body_len = 2 + 1 + 4 + data_len + 2;
-  cmd[0] = body_len & 0xFF;
-  cmd[1] = (body_len >> 8) & 0xFF;
-  cmd[2] = 0xf7; // 写RAM命令
-  
-  // 地址(字节地址)
-  cmd[3] = addr & 0xFF;
-  cmd[4] = (addr >> 8) & 0xFF;
-  cmd[5] = (addr >> 16) & 0xFF;
-  cmd[6] = (addr >> 24) & 0xFF;
-  
-  // 数据
-  memcpy(cmd + 7, data, data_len);
-  
-  // 填充
-  cmd[7 + data_len] = 0;
-  cmd[8 + data_len] = 0;
-  
-  // 发送命令
-  size_t written = gba_serial_write(port, cmd, cmd_len);
-  free(cmd);
-  
-  if (written != cmd_len) {
-    log_printf("[Serial] ERROR: Failed to write RAM command\n");
-    return false;
-  }
-  
-  // 尝试读取1字节ACK(非阻塞，超时后继续)
-  uint8_t ack;
-  size_t ack_read = 0;
-  int retry = 0;
-  while (ack_read == 0 && retry < 5) {
-    ack_read = gba_serial_read(port, &ack, 1);
-    if (ack_read == 0) {
-      retry++;
-#ifdef _WIN32
-      Sleep(1);
-#else
-      usleep(1000);
-#endif
-    }
-  }
-  
-  // ACK读取失败只记录警告，不中断操作
-  if (ack_read != 1) {
-    static int warn_count = 0;
-    if (warn_count < 3) {
-      log_printf("[Serial] WARNING: No ACK for RAM write (retry %d)\n", retry);
-      warn_count++;
-    }
-  }
-  
-  return true;
-}
-
-// 串口Flash编程(命令0xf9)
-// 用于将Flash内容写入到卡带的物理Flash
-static bool gba_serial_flash_program(serial_port_t port, uint32_t addr, const uint8_t* data, uint16_t data_len) {
-  if (port == INVALID_SERIAL_PORT || !data || data_len == 0) {
-    return false;
-  }
-  
-  // 构建命令包
-  uint16_t cmd_len = 2 + 1 + 4 + data_len + 2;
-  uint8_t* cmd = (uint8_t*)malloc(cmd_len);
-  if (!cmd) return false;
-  
-  // 长度字段包含：长度字段自己(2) + 命令(1) + 地址(4) + 数据(data_len) + 填充(2)
-  uint16_t body_len = 2 + 1 + 4 + data_len + 2;
-  cmd[0] = body_len & 0xFF;
-  cmd[1] = (body_len >> 8) & 0xFF;
-  cmd[2] = 0xf9; // Flash编程命令
-  
-  // 地址(字节地址)
-  cmd[3] = addr & 0xFF;
-  cmd[4] = (addr >> 8) & 0xFF;
-  cmd[5] = (addr >> 16) & 0xFF;
-  cmd[6] = (addr >> 24) & 0xFF;
-  
-  // 数据
-  memcpy(cmd + 7, data, data_len);
-  
-  // 填充
-  cmd[7 + data_len] = 0;
-  cmd[8 + data_len] = 0;
-  
-  // 发送命令
-  size_t written = gba_serial_write(port, cmd, cmd_len);
-  free(cmd);
-  
-  if (written != cmd_len) {
-    log_printf("[Serial] ERROR: Failed to write Flash program command\n");
-    return false;
-  }
-  
-  // Flash编程需要更长的等待时间
-#ifdef _WIN32
-  Sleep(100);
-#else
-  usleep(100000);
-#endif
-  
-  // 读取ACK
-  uint8_t ack;
-  size_t ack_read = 0;
-  int retry = 0;
-  while (ack_read == 0 && retry < 10) {
-    ack_read = gba_serial_read(port, &ack, 1);
-    if (ack_read == 0) {
-      retry++;
-#ifdef _WIN32
-      Sleep(10);
-#else
-      usleep(10000);
-#endif
-    }
-  }
-  
-  if (ack_read != 1 || ack != 0xAA) {
-    log_printf("[Serial] WARNING: No ACK for Flash program (retry %d)\n", retry);
-    return false;
-  }
-  
-  return true;
-}
-
-// 读取backup字节(支持串口)
-static uint8_t gba_read_backup_byte(gba_t* gba, uint32_t addr) {
-  // 检查是否使用串口ROM
-  if (gba->scratch && gba->scratch->use_realtime_rom && 
-      gba->scratch->rom_protocol == GBA_ROM_PROTOCOL_SERIAL) {
-    // 串口模式：读取前先刷新所有缓存的写入
-    if (gba->scratch->serial_write_count > 0) {
-      gba_flush_serial_writes(gba->scratch);
-    }
-    
-    // 通过串口读取RAM
-    serial_port_t port = *(serial_port_t*)gba->scratch->rom_source_serial;
-    uint8_t data = 0xFF;
-    if (gba_serial_read_ram(port, addr, &data, 1)) {
-      return data;
-    }
-    return 0xFF;
-  }
-  // 普通模式：从内存读取
-  return gba->mem.cart_backup[addr];
-}
-
-// 写入backup字节(支持串口)
-static void gba_write_backup_byte(gba_t* gba, uint32_t addr, uint8_t data) {
-  // 检查是否使用串口ROM
-  if (gba->scratch && gba->scratch->use_realtime_rom && 
-      gba->scratch->rom_protocol == GBA_ROM_PROTOCOL_SERIAL) {
-    // 通过串口写入RAM
-    serial_port_t port = *(serial_port_t*)gba->scratch->rom_source_serial;
-    gba_serial_write_ram(port, addr, &data, 1);
-    return;
-  }
-  // 普通模式：写入内存
-  gba->mem.cart_backup[addr] = data;
-}
-
-// 字节级ROM读取 - 支持按需加载和缓存
-// 当缓存未命中时，会读取一整块数据以优化性能
-#define GBA_ROM_CACHE_CHUNK_SIZE 4096
-
-static uint8_t gba_read_rom_byte(gba_scratch_t *scratch, size_t offset) {
-  if (!scratch->use_realtime_rom) {
-    return 0xFF; // 不应该调用到这里
-  }
-  
-  // 串口模式：读取前先刷新所有缓存的写入
-  if (scratch->rom_protocol == GBA_ROM_PROTOCOL_SERIAL && scratch->serial_write_count > 0) {
-    gba_flush_serial_writes(scratch);
-  }
-  
-  if (offset >= scratch->realtime_rom_size) {
-    return 0xFF;
-  }
-  
-  // 检查缓存是否已有这个字节
-  if (scratch->rom_cache_valid[offset] == 1) {
-    return scratch->rom_cache_data[offset];
-  }
-
-  // 缓存未命中，读取一整块数据以优化后续访问
-  // 计算块的起始地址(对齐到块大小)
-  size_t chunk_start = (offset / GBA_ROM_CACHE_CHUNK_SIZE) * GBA_ROM_CACHE_CHUNK_SIZE;
-  size_t chunk_size = GBA_ROM_CACHE_CHUNK_SIZE;
-  
-  // 确保不超出ROM大小
-  if (chunk_start + chunk_size > scratch->realtime_rom_size) {
-    chunk_size = scratch->realtime_rom_size - chunk_start;
-  }
-  
-  // 检查这个块是否已经部分或全部缓存
-  bool need_read = false;
-  for (size_t i = 0; i < chunk_size; i++) {
-    if (scratch->rom_cache_valid[chunk_start + i] != 1) {
-      need_read = true;
-      break;
-    }
-  }
-
-  if (scratch->rom_cache_valid[offset] == 0xFF) {
-    chunk_size = 2; // 如果这个字节标记为不缓存，缩小块大小以减少无用读取
-    chunk_start = offset - (offset % 2); // 对齐到2字节
-    need_read = true;
-  }
-  
-  if (need_read) {
-    // 读取整个块
-    bool success = false;
-    uint8_t* temp_buffer = (uint8_t*)malloc(chunk_size);
-    if (!temp_buffer) {
-      return 0xFF;
-    }
-    
-    switch (scratch->rom_protocol) {
-      case GBA_ROM_PROTOCOL_FILE:
-        if (scratch->rom_source_file) {
-          success = gba_load_realtime_rom_bytes_from_file(scratch->rom_source_file, chunk_start, temp_buffer, chunk_size);
-        }
-        break;
-      
-      case GBA_ROM_PROTOCOL_SERIAL:
-        if (scratch->rom_source_serial) {
-          serial_port_t port = *(serial_port_t*)scratch->rom_source_serial;
-          uint32_t addr_word = chunk_start / 2;
-          success = gba_serial_read_rom(port, addr_word, temp_buffer, chunk_size);
-          // if (success) {
-          //   printf("Loaded ROM chunk: offset=0x%zx, size=%zu bytes\n", chunk_start, chunk_size);
-          // }
-        }
-        break;
-      
-      case GBA_ROM_PROTOCOL_NET:
-        // TODO: 实现网络块读取
-        break;
-      
-      default:
-        break;
-    }
-    
-    // 更新缓存
-    if (success) {
-      memcpy(scratch->rom_cache_data + chunk_start, temp_buffer, chunk_size);
-      for (size_t i = 0; i < chunk_size; i++) {
-        if (scratch->rom_cache_valid[chunk_start + i] == 0) {
-          scratch->rom_cache_valid[chunk_start + i] = 1;
-        }
-      }
-    }
-    
-    free(temp_buffer);
-  }
-  // if (scratch->rom_cache_valid[offset] == 0xFF) {
-  //   log_printf("Byte at offset 0x%zx is marked as non-cacheable, value=0x%02x\n", 
-  //          offset, scratch->rom_cache_data[offset]);
-  // }
-  return scratch->rom_cache_data[offset];
-}
-
-static bool gba_save_rom_cache(gba_scratch_t *scratch, const uint8_t* data, size_t size) {
-  if (!scratch->use_realtime_rom || !data || size == 0 || !scratch->rom_cache_valid) {
-    return false;
-  }
-  
-  FILE* file = fopen(scratch->rom_cache_path, "wb");
-  if (!file) {
-    log_printf("Failed to open cache file for writing: %s\n", scratch->rom_cache_path);
-    return false;
-  }
-  
-  // 写入文件头：魔数 + 版本 + ROM大小
-  uint32_t magic = 0x43484147; // "GACH" (GBA Cache)
-  uint32_t version = 1;
-  uint32_t rom_size = (uint32_t)size;
-  
-  fwrite(&magic, sizeof(magic), 1, file);
-  fwrite(&version, sizeof(version), 1, file);
-  fwrite(&rom_size, sizeof(rom_size), 1, file);
-  
-  // 写入ROM数据
-  size_t data_written = fwrite(data, 1, size, file);
-  if (data_written != size) {
-    log_printf("Failed to write ROM data to cache\n");
-    fclose(file);
-    return false;
-  }
-  
-  // 写入valid标志位
-  size_t valid_written = fwrite(scratch->rom_cache_valid, 1, size, file);
-  if (valid_written != size) {
-    log_printf("Failed to write valid flags to cache\n");
-    fclose(file);
-    return false;
-  }
-  
-  fclose(file);
-  
-  // 统计已缓存的字节数
-  size_t cached_bytes = 0;
-  for (size_t i = 0; i < size; i++) {
-    if (scratch->rom_cache_valid[i]) cached_bytes++;
-  }
-  
-  log_printf("Successfully saved ROM cache to: %s (%zu/%zu bytes cached)\n", 
-         scratch->rom_cache_path, cached_bytes, size);
-  return true;
-}
-
-static bool gba_load_rom_cache(gba_scratch_t *scratch, uint8_t* buffer, size_t size) {
-  if (!scratch->use_realtime_rom || !scratch->rom_cache_valid) {
-    return false;
-  }
-  
-  FILE* file = fopen(scratch->rom_cache_path, "rb");
-  if (!file) {
-    log_printf("Cache file not found: %s\n", scratch->rom_cache_path);
-    return false;
-  }
-  
-  // 读取并验证文件头
-  uint32_t magic = 0, version = 0, rom_size = 0;
-  
-  if (fread(&magic, sizeof(magic), 1, file) != 1 || magic != 0x43484147) {
-    log_printf("Invalid cache file: bad magic number\n");
-    fclose(file);
-    return false;
-  }
-  
-  if (fread(&version, sizeof(version), 1, file) != 1 || version != 1) {
-    log_printf("Invalid cache file: unsupported version %u\n", version);
-    fclose(file);
-    return false;
-  }
-  
-  if (fread(&rom_size, sizeof(rom_size), 1, file) != 1 || rom_size != size) {
-    log_printf("Cache file size mismatch: expected %zu, got %u\n", size, rom_size);
-    fclose(file);
-    return false;
-  }
-  
-  // 读取ROM数据
-  size_t data_read = fread(buffer, 1, size, file);
-  if (data_read != size) {
-    log_printf("Failed to read ROM data from cache: read %zu/%zu bytes\n", data_read, size);
-    fclose(file);
-    return false;
-  }
-  
-  // 读取valid标志位
-  size_t valid_read = fread(scratch->rom_cache_valid, 1, size, file);
-  if (valid_read != size) {
-    log_printf("Failed to read valid flags from cache: read %zu/%zu bytes\n", valid_read, size);
-    fclose(file);
-    return false;
-  }
-  
-  fclose(file);
-  
-  // 统计已缓存的字节数
-  size_t cached_bytes = 0;
-  for (size_t i = 0; i < size; i++) {
-    if (scratch->rom_cache_valid[i]) cached_bytes++;
-  }
-  
-  log_printf("Successfully loaded ROM cache from: %s (%zu/%zu bytes cached)\n", 
-         scratch->rom_cache_path, cached_bytes, size);
-  return true;
-}
-
 void gba_unload(gba_t*gba,gba_scratch_t *scratch){
   log_printf("Unloading GBA\n");
   if(scratch->log_cmp_file)fclose(scratch->log_cmp_file);
   scratch->log_cmp_file=NULL;
-  
-  // 保存实时ROM的cache
-  if (scratch->use_realtime_rom && scratch->rom_cache_data && scratch->realtime_rom_size > 0) {
-    gba_save_rom_cache(scratch, scratch->rom_cache_data, scratch->realtime_rom_size);
-    
-    // 关闭文件句柄
-    if (scratch->rom_source_file) {
-      fclose(scratch->rom_source_file);
-      scratch->rom_source_file = NULL;
-    }
-    
-    // 关闭串口句柄
-    if (scratch->rom_source_serial) {
-      serial_port_t port = *(serial_port_t*)scratch->rom_source_serial;
-      gba_close_serial_port(port);
-      free(scratch->rom_source_serial);
-      scratch->rom_source_serial = NULL;
-    }
-    
-    // 释放缓存内存
-    // free(scratch->rom_cache_data); // 由模拟器释放
-    scratch->rom_cache_data = NULL;
-    
-    free(scratch->rom_cache_valid);
-    scratch->rom_cache_valid = NULL;
-    
-    // 释放RAM预读缓存
-    if (scratch->ram_prefetch_cache) {
-      free(scratch->ram_prefetch_cache);
-      scratch->ram_prefetch_cache = NULL;
-    }
-  }
-}
 
-// 串口模式下切换Flash bank
-static void gba_serial_flash_switch_bank(serial_port_t port, int bank) {
-  bank = (bank == 0) ? 0 : 1;
-  
-  log_printf("[Serial] Switching Flash bank to %d\n", bank);
-  
-  // 发送bank切换命令序列
-  uint8_t cmd_aa = 0xAA;
-  uint8_t cmd_55 = 0x55;
-  uint8_t cmd_b0 = 0xB0;
-  uint8_t bank_byte = (uint8_t)bank;
-  
-  gba_serial_write_ram(port, 0x5555, &cmd_aa, 1);
-  gba_serial_write_ram(port, 0x2AAA, &cmd_55, 1);
-  gba_serial_write_ram(port, 0x5555, &cmd_b0, 1);
-  gba_serial_write_ram(port, 0x0000, &bank_byte, 1);
-}
-
-// 串口模式下切换SRAM_128K bank (写入0x09000000切换)
-static void gba_serial_sram_switch_bank(serial_port_t port, int bank) {
-  bank = (bank == 0) ? 0 : 1;
-  
-  log_printf("[Serial] Switching SRAM bank to %d\n", bank);
-  uint16_t bank_byte = bank;
-  gba_serial_write_rom(port, 0x01000000>>1, (uint8_t*)&bank_byte, 2);
-}
-
-// 串口模式下擦除Flash芯片
-static bool gba_serial_flash_erase_chip(serial_port_t port) {
-  log_printf("[Serial] Erasing Flash chip...\n");
-  
-  // 发送Chip-Erase命令序列
-  uint8_t cmd_aa = 0xAA;
-  uint8_t cmd_55 = 0x55;
-  uint8_t cmd_80 = 0x80;
-  uint8_t cmd_10 = 0x10;
-  
-  gba_serial_write_ram(port, 0x5555, &cmd_aa, 1);
-  gba_serial_write_ram(port, 0x2AAA, &cmd_55, 1);
-  gba_serial_write_ram(port, 0x5555, &cmd_80, 1);
-  gba_serial_write_ram(port, 0x5555, &cmd_aa, 1);
-  gba_serial_write_ram(port, 0x2AAA, &cmd_55, 1);
-  gba_serial_write_ram(port, 0x5555, &cmd_10, 1); // Chip-Erase
-  
-  // 等待擦除完成(轮询0x0000地址，直到返回0xFF)
-  log_printf("[Serial] Waiting for erase to complete...\n");
-  uint8_t status;
-  int max_retries = 60; // 最多等待60秒
-  int retry = 0;
-  
-  while (retry < max_retries) {
-    // 等待1秒
-#ifdef _WIN32
-    Sleep(1000);
-#else
-    usleep(1000000);
-#endif
-    
-    // 读取状态
-    if (!gba_serial_read_ram(port, 0x0000, &status, 1)) {
-      log_printf("[Serial] ERROR: Failed to read erase status\n");
-      return false;
-    }
-    
-    log_printf("[Serial] Erase status: 0x%02x\n", status);
-    
-    if (status == 0xFF) {
-      log_printf("[Serial] Flash erase completed\n");
-      return true;
-    }
-    
-    retry++;
-  }
-  
-  log_printf("[Serial] ERROR: Flash erase timeout after %d seconds\n", max_retries);
-  return false;
-}
-
-// 串口模式下加载Flash存档
-static bool gba_serial_load_flash_backup(gba_t* gba, uint32_t flash_size) {
-  if (!gba || !gba->scratch || !gba->scratch->rom_source_serial) {
-    return false;
-  }
-  
-  serial_port_t port = *(serial_port_t*)gba->scratch->rom_source_serial;
-  
-  log_printf("[Serial] Loading Flash backup from cartridge (%u bytes)...\n", flash_size);
-  
-  // 如果是128KB Flash，需要分两个bank读取
-  if (flash_size == 128 * 1024) {
-    // 读取Bank 0 (前64KB)
-    log_printf("[Serial] Reading Flash bank 0...\n");
-    gba_serial_flash_switch_bank(port, 0);
-    
-    const uint32_t chunk_size = 4096;
-    for (uint32_t offset = 0; offset < 64 * 1024; offset += chunk_size) {
-      if (!gba_serial_read_ram(port, offset, gba->mem.cart_backup + offset, chunk_size)) {
-        log_printf("[Serial] ERROR: Failed to read Flash bank 0 at offset 0x%05x\n", offset);
-        return false;
-      }
-    }
-    
-    // 读取Bank 1 (后64KB)
-    log_printf("[Serial] Reading Flash bank 1...\n");
-    gba_serial_flash_switch_bank(port, 1);
-    
-    for (uint32_t offset = 0; offset < 64 * 1024; offset += chunk_size) {
-      if (!gba_serial_read_ram(port, offset, gba->mem.cart_backup + 64 * 1024 + offset, chunk_size)) {
-        log_printf("[Serial] ERROR: Failed to read Flash bank 1 at offset 0x%05x\n", offset);
-        return false;
-      }
-    }
-    
-    // 切换回bank 0
-    gba_serial_flash_switch_bank(port, 0);
-    
-  } else {
-    // 64KB Flash，直接读取
-    const uint32_t chunk_size = 4096;
-    for (uint32_t offset = 0; offset < flash_size; offset += chunk_size) {
-      if (!gba_serial_read_ram(port, offset, gba->mem.cart_backup + offset, chunk_size)) {
-        log_printf("[Serial] ERROR: Failed to read Flash at offset 0x%05x\n", offset);
-        return false;
-      }
-    }
-  }
-  
-  log_printf("[Serial] Flash backup loaded successfully\n");
-  return true;
-}
-
-// 串口模式下加载SRAM_128K存档
-static bool gba_serial_load_sram_backup(gba_t* gba, int size) {
-  if (!gba || !gba->scratch || !gba->scratch->rom_source_serial) {
-    return false;
-  }
-  
-  serial_port_t port = *(serial_port_t*)gba->scratch->rom_source_serial;
-  
-  log_printf("[Serial] Loading SRAM_128K backup from cartridge (128KB)...\n");
-  
-  const uint32_t chunk_size = 4096;
-  
-  // 读取Bank 0 (前64KB)
-  log_printf("[Serial] Reading SRAM bank 0...\n");
-  gba_serial_sram_switch_bank(port, 0);
-  
-  for (uint32_t offset = 0; offset < 64 * 1024; offset += chunk_size) {
-    if (!gba_serial_read_ram(port, offset, gba->mem.cart_backup + offset, chunk_size)) {
-      log_printf("[Serial] ERROR: Failed to read SRAM bank 0 at offset 0x%05x\n", offset);
-      return false;
-    }
-  }
-  if (size <= 64 * 1024) {
-    log_printf("[Serial] SRAM_128K backup loaded successfully (only bank 0 used)\n");
-    return true;
-  }
-  // 读取Bank 1 (后64KB)
-  log_printf("[Serial] Reading SRAM bank 1...\n");
-  gba_serial_sram_switch_bank(port, 1);
-  
-  for (uint32_t offset = 0; offset < 64 * 1024; offset += chunk_size) {
-    if (!gba_serial_read_ram(port, offset, gba->mem.cart_backup + 64 * 1024 + offset, chunk_size)) {
-      log_printf("[Serial] ERROR: Failed to read SRAM bank 1 at offset 0x%05x\n", offset);
-      return false;
-    }
-  }
-  
-  // 切换回bank 0
-  gba_serial_sram_switch_bank(port, 0);
-  
-  log_printf("[Serial] SRAM_128K backup loaded successfully\n");
-  return true;
-}
-
-// 串口模式下同步Flash到卡带
-// 当backup_is_dirty变为false时调用，表示发生了存档
-static void gba_serial_sync_flash_backup(gba_t* gba, int size) {
-  if (!gba || !gba->scratch) return;
-  
-  // 检查是否是串口模式
-  if (!gba->scratch->use_realtime_rom || 
-      gba->scratch->rom_protocol != GBA_ROM_PROTOCOL_SERIAL) {
-    return;
-  }
-  
-  // 检查是否是Flash类型
-  if (gba->cart.backup_type != GBA_BACKUP_FLASH_64K && 
-      gba->cart.backup_type != GBA_BACKUP_FLASH_128K) {
-    return;
-  }
-  
-  serial_port_t port = *(serial_port_t*)gba->scratch->rom_source_serial;
-  
-  log_printf("[Serial] Syncing Flash backup to 卡带 (%u bytes)...\n", size);
-  
-  const uint32_t chunk_size = 4096;
-  bool success = true;
-  
-  // 如果是128KB Flash，需要分两个bank写入
-  if (size == 128 * 1024) {
-    // 切换到Bank 0并擦除
-    log_printf("[Serial] Programming Flash bank 0...\n");
-    gba_serial_flash_switch_bank(port, 0);
-    
-    // 擦除整个芯片
-    if (!gba_serial_flash_erase_chip(port)) {
-      log_printf("[Serial] ERROR: Failed to erase Flash chip\n");
-      return;
-    }
-    
-    for (uint32_t offset = 0; offset < 64 * 1024 && success; offset += chunk_size) {
-      log_printf("[Serial] Programming Flash: bank=0, offset=0x%05x, size=%u bytes\n", offset, chunk_size);
-      success = gba_serial_flash_program(port, offset, gba->mem.cart_backup + offset, chunk_size);
-      if (!success) {
-        log_printf("[Serial] ERROR: Flash program failed at bank 0, offset 0x%05x\n", offset);
-        break;
-      }
-    }
-    
-    if (success) {
-      // 写入Bank 1 (后64KB)
-      log_printf("[Serial] Programming Flash bank 1...\n");
-      gba_serial_flash_switch_bank(port, 1);
-      
-      for (uint32_t offset = 0; offset < 64 * 1024 && success; offset += chunk_size) {
-        log_printf("[Serial] Programming Flash: bank=1, offset=0x%05x, size=%u bytes\n", offset, chunk_size);
-        success = gba_serial_flash_program(port, offset, gba->mem.cart_backup + 64 * 1024 + offset, chunk_size);
-        if (!success) {
-          log_printf("[Serial] ERROR: Flash program failed at bank 1, offset 0x%05x\n", offset);
-          break;
-        }
-      }
-      
-      // 切换回bank 0
-      gba_serial_flash_switch_bank(port, 0);
-    }
-  } else {
-    // 64KB Flash，先擦除再写入
-    if (!gba_serial_flash_erase_chip(port)) {
-      log_printf("[Serial] ERROR: Failed to erase Flash chip\n");
-      return;
-    }
-    
-    for (uint32_t offset = 0; offset < size && success; offset += chunk_size) {
-      log_printf("[Serial] Programming Flash: offset=0x%05x, size=%u bytes\n", offset, chunk_size);
-      success = gba_serial_flash_program(port, offset, gba->mem.cart_backup + offset, chunk_size);
-      if (!success) {
-        log_printf("[Serial] ERROR: Flash program failed at offset 0x%05x\n", offset);
-        break;
-      }
-    }
-  }
-  
-  if (success) {
-    log_printf("[Serial] Flash sync completed successfully\n");
-  } else {
-    log_printf("[Serial] Flash sync failed\n");
-  }
-}
-
-// 串口模式下同步SRAM_128K到卡带
-static void gba_serial_sync_sram_backup(gba_t* gba, int size) {
-  if (!gba || !gba->scratch) return;
-  
-  // 检查是否是串口模式
-  if (!gba->scratch->use_realtime_rom || 
-      gba->scratch->rom_protocol != GBA_ROM_PROTOCOL_SERIAL) {
-    return;
-  }
-  
-  // 检查是否是SRAM_128K类型
-  if (gba->cart.backup_type != GBA_BACKUP_SRAM_128K) {
-    return;
-  }
-  
-  serial_port_t port = *(serial_port_t*)gba->scratch->rom_source_serial;
-  
-  log_printf("[Serial] Syncing SRAM_128K backup to cartridge (128KB)...\n");
-  
-  const uint32_t chunk_size = 4096;
-  bool success = true;
-  
-  // 写入Bank 0 (前64KB)
-  log_printf("[Serial] Writing SRAM bank 0...\n");
-  gba_serial_sram_switch_bank(port, 0);
-  
-  for (uint32_t offset = 0; offset < 64 * 1024 && success; offset += chunk_size) {
-    log_printf("[Serial] Writing SRAM: bank=0, offset=0x%05x, size=%u bytes\n", offset, chunk_size);
-    success = gba_serial_write_ram(port, offset, gba->mem.cart_backup + offset, chunk_size);
-    if (!success) {
-      log_printf("[Serial] ERROR: SRAM write failed at bank 0, offset 0x%05x\n", offset);
-      break;
-    }
-  }
-  
-  if (success && size > 64 * 1024) {
-    // 写入Bank 1 (后64KB)
-    log_printf("[Serial] Writing SRAM bank 1...\n");
-    gba_serial_sram_switch_bank(port, 1);
-    
-    for (uint32_t offset = 0; offset < 64 * 1024 && success; offset += chunk_size) {
-      log_printf("[Serial] Writing SRAM: bank=1, offset=0x%05x, size=%u bytes\n", offset, chunk_size);
-      success = gba_serial_write_ram(port, offset, gba->mem.cart_backup + 64 * 1024 + offset, chunk_size);
-      if (!success) {
-        log_printf("[Serial] ERROR: SRAM write failed at bank 1, offset 0x%05x\n", offset);
-        break;
-      }
-    }
-    
-    // 切换回bank 0
-    gba_serial_sram_switch_bank(port, 0);
-  }
-  
-  if (success) {
-    log_printf("[Serial] SRAM_128K sync completed successfully\n");
-  } else {
-    log_printf("[Serial] SRAM_128K sync failed\n");
-  }
+  // 保存实时ROM缓存、关闭串口/文件句柄并释放辅助内存 (DirectPlay 公用层)
+  cs_serial_shutdown(&scratch->serial);
 }
 
 bool gba_load_rom(sb_emu_state_t*emu,gba_t* gba, gba_scratch_t *scratch){
@@ -3709,11 +2057,11 @@ bool gba_load_rom(sb_emu_state_t*emu,gba_t* gba, gba_scratch_t *scratch){
     
     // 设置协议类型
     if (strcmp(protocol_str, "FILE") == 0) {
-      scratch->rom_protocol = GBA_ROM_PROTOCOL_FILE;
+      scratch->serial.rom_protocol = SB_CART_PROTOCOL_FILE;
     } else if (strcmp(protocol_str, "SERIAL") == 0) {
-      scratch->rom_protocol = GBA_ROM_PROTOCOL_SERIAL;
+      scratch->serial.rom_protocol = SB_CART_PROTOCOL_SERIAL;
     } else if (strcmp(protocol_str, "NET") == 0) {
-      scratch->rom_protocol = GBA_ROM_PROTOCOL_NET;
+      scratch->serial.rom_protocol = SB_CART_PROTOCOL_NET;
     } else {
       log_printf("Unknown protocol type: %s\n", protocol_str);
       return false;
@@ -3731,84 +2079,84 @@ bool gba_load_rom(sb_emu_state_t*emu,gba_t* gba, gba_scratch_t *scratch){
     }
     
     // 设置实时ROM参数
-    scratch->use_realtime_rom = true;
-    scratch->realtime_rom_size = rom_size;
-    scratch->custom_backup_type = backup_type;
-    scratch->serial_write_count = 0; // 初始化写入缓存计数
+    scratch->serial.use_realtime_rom = true;
+    scratch->serial.realtime_rom_size = rom_size;
+    scratch->serial.custom_backup_type = backup_type;
+    scratch->serial.serial_write_count = 0; // 初始化写入缓存计数
     
     // 初始化RAM预读缓存
-    scratch->ram_prefetch_cache = NULL;
-    scratch->ram_prefetch_start = 0;
-    scratch->ram_prefetch_size = 0;
-    scratch->ram_prefetch_valid = false;
+    scratch->serial.ram_prefetch_cache = NULL;
+    scratch->serial.ram_prefetch_start = 0;
+    scratch->serial.ram_prefetch_size = 0;
+    scratch->serial.ram_prefetch_valid = false;
     
-    strncpy(scratch->rom_source_address, address, SB_FILE_PATH_SIZE - 1);
-    scratch->rom_source_address[SB_FILE_PATH_SIZE - 1] = '\0';
+    strncpy(scratch->serial.rom_source_address, address, SB_FILE_PATH_SIZE - 1);
+    scratch->serial.rom_source_address[SB_FILE_PATH_SIZE - 1] = '\0';
     
     // 设置cache路径(保存到save_data_base_path目录下)
-    snprintf(scratch->rom_cache_path, SB_FILE_PATH_SIZE, "%s_rom_cache.gba", emu->save_data_base_path);
+    snprintf(scratch->serial.rom_cache_path, SB_FILE_PATH_SIZE, "%s_rom_cache.gba", emu->save_data_base_path);
     
     // 分配ROM数据缓冲区
-    scratch->rom_cache_data = (uint8_t*)malloc(rom_size);
-    if (!scratch->rom_cache_data) {
+    scratch->serial.rom_cache_data = (uint8_t*)malloc(rom_size);
+    if (!scratch->serial.rom_cache_data) {
       log_printf("Failed to allocate memory for ROM cache (%zu bytes)\n", rom_size);
       return false;
     }
     
     // 分配缓存有效位数组
-    scratch->rom_cache_valid = (uint8_t*)calloc(rom_size, 1); // 初始化为0(未缓存)
+    scratch->serial.rom_cache_valid = (uint8_t*)calloc(rom_size, 1); // 初始化为0(未缓存)
     for (int i = 0; i < 0xFF; i++) {
       if (i >= 0xC4 && i <= 0xC8) continue;
-      scratch->rom_cache_valid[i] = 0xFF;
+      scratch->serial.rom_cache_valid[i] = 0xFF;
     }
-    if (!scratch->rom_cache_valid) {
+    if (!scratch->serial.rom_cache_valid) {
       log_printf("Failed to allocate memory for ROM cache valid bits (%zu bytes)\n", rom_size);
-      free(scratch->rom_cache_data);
-      scratch->rom_cache_data = NULL;
+      free(scratch->serial.rom_cache_data);
+      scratch->serial.rom_cache_data = NULL;
       return false;
     }
     
     // 初始化ROM数据为0xFF
-    memset(scratch->rom_cache_data, 0xFF, rom_size);
+    memset(scratch->serial.rom_cache_data, 0xFF, rom_size);
     
     // 打开文件或串口句柄
-    if (scratch->rom_protocol == GBA_ROM_PROTOCOL_FILE) {
-      scratch->rom_source_file = fopen(address, "rb");
-      if (!scratch->rom_source_file) {
+    if (scratch->serial.rom_protocol == SB_CART_PROTOCOL_FILE) {
+      scratch->serial.rom_source_file = fopen(address, "rb");
+      if (!scratch->serial.rom_source_file) {
         log_printf("Failed to open ROM source file: %s\n", address);
-        free(scratch->rom_cache_data);
-        free(scratch->rom_cache_valid);
-        scratch->rom_cache_data = NULL;
-        scratch->rom_cache_valid = NULL;
+        free(scratch->serial.rom_cache_data);
+        free(scratch->serial.rom_cache_valid);
+        scratch->serial.rom_cache_data = NULL;
+        scratch->serial.rom_cache_valid = NULL;
         return false;
       }
       log_printf("Opened ROM source file: %s\n", address);
-    } else if (scratch->rom_protocol == GBA_ROM_PROTOCOL_SERIAL) {
-      serial_port_t port = gba_open_serial_port(address);
+    } else if (scratch->serial.rom_protocol == SB_CART_PROTOCOL_SERIAL) {
+      serial_port_t port = cs_serial_open(address);
       if (port == INVALID_SERIAL_PORT) {
         log_printf("Failed to open serial port: %s\n", address);
-        free(scratch->rom_cache_data);
-        free(scratch->rom_cache_valid);
-        scratch->rom_cache_data = NULL;
-        scratch->rom_cache_valid = NULL;
+        free(scratch->serial.rom_cache_data);
+        free(scratch->serial.rom_cache_valid);
+        scratch->serial.rom_cache_data = NULL;
+        scratch->serial.rom_cache_valid = NULL;
         return false;
       }
       // 分配并存储串口句柄
-      scratch->rom_source_serial = malloc(sizeof(serial_port_t));
-      if (!scratch->rom_source_serial) {
-        gba_close_serial_port(port);
-        free(scratch->rom_cache_data);
-        free(scratch->rom_cache_valid);
-        scratch->rom_cache_data = NULL;
-        scratch->rom_cache_valid = NULL;
+      scratch->serial.rom_source_serial = malloc(sizeof(serial_port_t));
+      if (!scratch->serial.rom_source_serial) {
+        cs_serial_close(port);
+        free(scratch->serial.rom_cache_data);
+        free(scratch->serial.rom_cache_valid);
+        scratch->serial.rom_cache_data = NULL;
+        scratch->serial.rom_cache_valid = NULL;
         return false;
       }
-      *(serial_port_t*)scratch->rom_source_serial = port;
+      *(serial_port_t*)scratch->serial.rom_source_serial = port;
       log_printf("Opened serial port: %s\n", address);
     }
     
     // // 尝试从cache文件加载已缓存的数据和valid标志
-    // bool loaded_from_cache = gba_load_rom_cache(scratch, scratch->rom_cache_data, rom_size);
+    // bool loaded_from_cache = cs_cache_load(scratch, scratch->serial.rom_cache_data, rom_size);
     // if (loaded_from_cache) {
     //   // valid标志已经从cache文件加载，不需要额外设置
     //   log_printf("Loaded ROM cache with validity flags\n");
@@ -3819,17 +2167,17 @@ bool gba_load_rom(sb_emu_state_t*emu,gba_t* gba, gba_scratch_t *scratch){
     
     // 更新emu状态，使用cache数据
     free(emu->rom_data); // 释放原有ROM数据
-    emu->rom_data = scratch->rom_cache_data;
+    emu->rom_data = scratch->serial.rom_cache_data;
     emu->rom_size = rom_size;
 
-    if (scratch->rom_protocol == GBA_ROM_PROTOCOL_SERIAL && scratch->custom_backup_type == -1) {
+    if (scratch->serial.rom_protocol == SB_CART_PROTOCOL_SERIAL && scratch->serial.custom_backup_type == -1) {
       // 检测存档类型
       log_printf("Detecting backup type for serial ROM...\n");
       // 只检测SRAM_128K和Flash类型
       // SRAM类型的特点是写入后立即变化，Flash类型需要特殊命令写入
       // 1. 备份 0x0000
       uint8_t original_data[16];
-      if (!gba_serial_read_ram(*(serial_port_t*)scratch->rom_source_serial, 0x0000, original_data, sizeof(original_data))) {
+      if (!gba_serial_read_ram(*(serial_port_t*)scratch->serial.rom_source_serial, 0x0000, original_data, sizeof(original_data))) {
         log_printf("Failed to read original data for backup detection\n");
       } else {
         uint8_t test_data[16];
@@ -3839,22 +2187,22 @@ bool gba_load_rom(sb_emu_state_t*emu,gba_t* gba, gba_scratch_t *scratch){
           test_data[i + 1] = 0x55;
           test_data[i + 2] = 0xAA;
           test_data[i + 3] = 0x55;
-          if (!gba_serial_write_ram(*(serial_port_t*)scratch->rom_source_serial, 0x0000 + i, test_data + i, 4)) {
+          if (!gba_serial_write_ram(*(serial_port_t*)scratch->serial.rom_source_serial, 0x0000 + i, test_data + i, 4)) {
             log_printf("Failed to write test data for backup detection\n");
           }
         }
         // 3. 读取回写数据
         uint8_t verify_data[16];
-        if (!gba_serial_read_ram(*(serial_port_t*)scratch->rom_source_serial, 0x0000, verify_data, sizeof(verify_data))) {
+        if (!gba_serial_read_ram(*(serial_port_t*)scratch->serial.rom_source_serial, 0x0000, verify_data, sizeof(verify_data))) {
           log_printf("Failed to read back data for backup detection\n");
         } else {
           // 4. 比较数据
           if (memcmp(test_data, verify_data, sizeof(test_data)) == 0) {
             // 数据匹配，说明是SRAM类型
-            scratch->custom_backup_type = GBA_BACKUP_SRAM_128K;
+            scratch->serial.custom_backup_type = GBA_BACKUP_SRAM_128K;
             log_printf("Detected backup type: SRAM_128K\n");
             // 恢复原数据
-            if (!gba_serial_write_ram(*(serial_port_t*)scratch->rom_source_serial, 0x0000, original_data, sizeof(original_data))) {
+            if (!gba_serial_write_ram(*(serial_port_t*)scratch->serial.rom_source_serial, 0x0000, original_data, sizeof(original_data))) {
               log_printf("Failed to restore original data after backup detection\n");
             }
           } else {
@@ -3862,7 +2210,7 @@ bool gba_load_rom(sb_emu_state_t*emu,gba_t* gba, gba_scratch_t *scratch){
             // 通过读取Flash ID来确定Flash类型（64K还是128K）
             log_printf("Data mismatch, detecting Flash type by reading Chip ID...\n");
             
-            serial_port_t port = *(serial_port_t*)scratch->rom_source_serial;
+            serial_port_t port = *(serial_port_t*)scratch->serial.rom_source_serial;
             
             // 备份 0x5555, 0x2AAA, 0x0000 的原始数据
             uint8_t temp5555, temp2AAA, temp0000;
@@ -3905,14 +2253,14 @@ bool gba_load_rom(sb_emu_state_t*emu,gba_t* gba, gba_scratch_t *scratch){
                                  flash_id == 0xBF5B);   // Unlicensed SST49LF080A
             
             if (is_64k_flash) {
-              scratch->custom_backup_type = GBA_BACKUP_FLASH_64K;
+              scratch->serial.custom_backup_type = GBA_BACKUP_FLASH_64K;
               log_printf("Detected Flash ID: 0x%04X -> FLASH_64K\n", flash_id);
             } else if (is_128k_flash) {
-              scratch->custom_backup_type = GBA_BACKUP_FLASH_128K;
+              scratch->serial.custom_backup_type = GBA_BACKUP_FLASH_128K;
               log_printf("Detected Flash ID: 0x%04X -> FLASH_128K (with bank switching)\n", flash_id);
             } else {
               // 未知ID，可能是EEPROM或无存档
-              scratch->custom_backup_type = -2; // 标记为未知
+              scratch->serial.custom_backup_type = -2; // 标记为未知
             }
             
             // 恢复原始数据
@@ -3938,12 +2286,12 @@ bool gba_load_rom(sb_emu_state_t*emu,gba_t* gba, gba_scratch_t *scratch){
   gba->mem.cart_rom = emu->rom_data;
 
   // 设置backup类型
-  if (scratch->use_realtime_rom && scratch->custom_backup_type >= 0) {
+  if (scratch->serial.use_realtime_rom && scratch->serial.custom_backup_type >= 0) {
     // 使用自定义配置的backup类型
-    gba->cart.backup_type = scratch->custom_backup_type;
+    gba->cart.backup_type = scratch->serial.custom_backup_type;
     const char* backup_names[] = {"NONE", "EEPROM", "EEPROM_512B", "EEPROM_8KB", "SRAM", "FLASH_64K", "FLASH_128K", "SRAM_128K", "DIRECT"};
     log_printf("Using custom backup type: %s\n", backup_names[gba->cart.backup_type]);
-  } else if (scratch->use_realtime_rom && scratch->rom_protocol == GBA_ROM_PROTOCOL_SERIAL && scratch->custom_backup_type == -2) {
+  } else if (scratch->serial.use_realtime_rom && scratch->serial.rom_protocol == SB_CART_PROTOCOL_SERIAL && scratch->serial.custom_backup_type == -2) {
     gba->cart.backup_type = GBA_BACKUP_DIRECT; // 先设为DIRECT，实际访问时通过gba_read_backup_byte/gba_write_backup_byte处理
     log_printf("Serial ROM: Backup type set to DIRECT (will use serial RAM access)\n");
   } else {
@@ -3955,8 +2303,8 @@ bool gba_load_rom(sb_emu_state_t*emu,gba_t* gba, gba_scratch_t *scratch){
   bool backup_loaded = false;
   
   // 如果是串口模式且是Flash或SRAM_128K类型，从串口读取
-  if (scratch->use_realtime_rom && 
-      scratch->rom_protocol == GBA_ROM_PROTOCOL_SERIAL &&
+  if (scratch->serial.use_realtime_rom && 
+      scratch->serial.rom_protocol == SB_CART_PROTOCOL_SERIAL &&
       (gba->cart.backup_type == GBA_BACKUP_FLASH_64K || 
        gba->cart.backup_type == GBA_BACKUP_FLASH_128K ||
        gba->cart.backup_type == GBA_BACKUP_SRAM_128K ||
