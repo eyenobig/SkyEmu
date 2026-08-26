@@ -11,7 +11,7 @@
 //    保证两边 MBC 状态一致。
 //  - SRAM 以本地 ram_data 镜像为准: 启动时整块从真实卡带读入, 存档同步时整块回写。
 #pragma once
-#include "cart_serial/cart_serial_base.h"
+#include "cart_serial_base.h"
 
 // MBC 常量 (与 gb.h 中 SB_MBC_* 同值, 此处独立定义使本文件自包含)
 #define CS_GB_NO_MBC 0

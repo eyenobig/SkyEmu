@@ -407,6 +407,8 @@ endif()
 
 add_library(skyemu_libretro SHARED EXCLUDE_FROM_ALL src/libretro.c src/shared.c src/localization.c)
 set_target_properties(skyemu_libretro PROPERTIES PREFIX "")
+# DirectPlay cart_serial 头文件以 src 为根引用 (cart_serial/xxx.h, sb_types.h)
+include_directories("${CMAKE_CURRENT_SOURCE_DIR}/src")
 if (MACOS OR IOS)
     find_library(FoundationLib CoreFoundation)
     target_link_libraries(skyemu_libretro ${FoundationLib})

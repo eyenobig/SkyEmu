@@ -26,9 +26,8 @@
   #include <IOKit/usb/IOUSBLib.h>
 #elif defined(__linux__)
   #include <dirent.h>
+#endif
 
-
-// 日志输出配置宏
 // 日志输出配置宏
 #ifndef CART_SERIAL_LOG_ENABLED
   #define CART_SERIAL_LOG_ENABLED 1  // 默认启用日志
@@ -107,7 +106,7 @@ static void log_close() {
   #include <sys/ioctl.h>
   typedef int serial_port_t;
   #define INVALID_SERIAL_PORT -1
-
+#endif
 
 // ---------- 平台串口原语 ----------
 // DTR控制函数(模拟Python的ser.dtr操作)

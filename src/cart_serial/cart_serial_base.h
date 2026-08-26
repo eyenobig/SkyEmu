@@ -4,7 +4,7 @@
 // 提取自 ChisBread/SkyEmu dev_readfromserial (DirectPlayV0.6)。
 #pragma once
 #include "sb_types.h"
-#include "cart_serial/serial_port.h"
+#include "serial_port.h"
 
 // ROM实时读取协议类型
 typedef enum {
