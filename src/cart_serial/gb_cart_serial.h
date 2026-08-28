@@ -216,7 +216,9 @@ static bool gb_serial_mirror_sram(sb_cart_serial_t* cs, uint8_t mbc, uint8_t* ra
     int len = CS_GB_RAM_BANK_SIZE - win_off;
     if (len > 4096) len = 4096;
     if (off + len > ram_size) len = ram_size - off;
-    if (bank > 0 && !gb_serial_switch_ram_bank(cs, mbc, (unsigned)bank)) { ok = false; break; }
+    // 注意: RAM bank 寄存器跨 MCU 复位保持(读卡器不断卡带电源), 必须
+    // 无条件显式切换到目标 bank, 包括 bank 0 (真机实测教训)
+    if (!gb_serial_switch_ram_bank(cs, mbc, (unsigned)bank)) { ok = false; break; }
     ok = gb_serial_bus_read(port, CS_GB_RAM_WINDOW + (uint32_t)win_off, ram_data + off, (uint16_t)len);
     off += len;
   }
@@ -241,7 +243,9 @@ static void gb_serial_sync_ram_to_cart(sb_cart_serial_t* cs, uint8_t mbc, const 
     int len = CS_GB_RAM_BANK_SIZE - win_off;
     if (len > 1024) len = 1024;
     if (off + len > ram_size) len = ram_size - off;
-    if (bank > 0 && !gb_serial_switch_ram_bank(cs, mbc, (unsigned)bank)) { ok = false; break; }
+    // 注意: RAM bank 寄存器跨 MCU 复位保持(读卡器不断卡带电源), 必须
+    // 无条件显式切换到目标 bank, 包括 bank 0 (真机实测教训)
+    if (!gb_serial_switch_ram_bank(cs, mbc, (unsigned)bank)) { ok = false; break; }
     ok = gb_serial_bus_write(port, CS_GB_RAM_WINDOW + (uint32_t)win_off, ram_data + off, (uint16_t)len);
     off += len;
   }
