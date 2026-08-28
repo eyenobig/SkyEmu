@@ -36,3 +36,5 @@ jobs:
         #  # Newline-delimited list of path globs for asset files to upload
         #  files: build/bin/*
  
+
+# directplay testing build
